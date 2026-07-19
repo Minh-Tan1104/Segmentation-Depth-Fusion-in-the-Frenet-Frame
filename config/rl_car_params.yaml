@@ -1,0 +1,259 @@
+# =============================================================================
+# Tham số tập trung cho toàn bộ stack RL_CAR.
+#
+# Muốn chỉnh tốc độ, EKF, planner, model, topic... thì SỬA FILE NÀY, không cần
+# đụng vào launch/*.py hay node.py nữa. Cả 2 launch file (full_stack.launch.py,
+# rgb_dual_model.launch.py) đều load thẳng file này cho mọi node.
+#
+# Giá trị ở đây lấy theo đúng giá trị ĐANG THỰC SỰ chạy khi launch full stack
+# (tức giá trị trong launch file cũ, vì launch args override default trong
+# node.py). Một vài default hardcode trong node.py trước đây bị lệch với
+# default trong launch file (vd plan_max_curvature, plan_lookahead,
+# plan_clearance, plan_center_offset, seg_x_min/seg_x_max, manual_steer_axis,
+# auto_speed, lookahead_distance) — file này thống nhất lại theo giá trị đã
+# chạy thật, default trong node.py giờ chỉ còn là fallback nếu thiếu file này.
+# =============================================================================
+
+# LƯU Ý: plan_enable..plan_center_offset dùng chung cho cả control_node và
+# planner_motion_node (xem comment đầu control/node.py: control_node tự sở
+# hữu 1 bản Frenet Optimal Planner riêng để vẫn replan được khi mất line, còn
+# planner_motion_node chạy song song chỉ phục vụ visualization/rosbag — 2 bên
+# NÊN cùng cấu hình). rcl_yaml_param_parser không hỗ trợ YAML anchor/alias để
+# tham chiếu giá trị, nhưng CÓ hỗ trợ wildcard node name "/**" (từ Foxy) áp
+# dụng 1 block param cho MỌI node load file này — nên khai báo các plan_*
+# MỘT LẦN DUY NHẤT ở khối /** bên dưới, chỉ cần sửa ở đây khi đổi giá trị.
+/**:
+  ros__parameters:
+    plan_enable: true                    # bật/tắt việc sinh quỹ đạo bằng Frenet Optimal Planner
+    plan_speed: 1.0                      # vận tốc giả định/đích cho quỹ đạo [m/s]
+    plan_robot_radius: 0.6               # bán kính an toàn của xe khi né vật cản [m]
+    plan_road_width: 2.5                 # nửa bề rộng lấy mẫu ngang khi enumerate ứng viên [m]
+    plan_max_curvature: 20.0               # độ cong tối đa cho phép của quỹ đạo [1/m]
+    plan_lookahead: 1.54                  # thời gian nhìn trước để lấy target_d [s]
+    plan_clearance: 3.2                  # khoảng cách mềm để né vật cản [m]
+    plan_obstacle_weight: 20.0           # trọng số phạt khi quỹ đạo đi gần vật cản
+    plan_center_offset: 0.0           # +d = lệch điểm giữa làn sang phải [m]
+    plan_center_weight: 20.0              # phạt lệch center_offset (k_d) — tăng lên = planner chấp nhận
+                                          # jerk ngang lớn hơn để bám giữa làn chặt hơn (cũng làm bám
+                                          # target_speed chặt hơn, vì k_d dùng chung cho cả 2 cụm cost)
+    plan_min_horizon_s: 2.0              # horizon tối thiểu polynomial ngang [s] — tăng từ 3.5 mặc định
+    plan_max_horizon_s: 3.0              # gốc để giảm độ cong đoạn đầu khi lệch ngang lớn + center_weight
+                                          # cao ép về giữa gấp (đo: c_d=1.5m, center_weight=4.0 -> max|kappa|
+                                          # đoạn đầu giảm 0.237->0.122 khi horizon 4.0s->6.0s, vẫn về hẳn
+                                          # center_offset); đổi lại path dài hơn (s_max ~8m thay vì ~6m)
+    plan_d_road_w: 0.4                    # bước nhảy khi lấy mẫu di (lệch ngang ứng viên), phạm vi hardcode
+                                          # [-2+center_offset, 3+center_offset] trong frenet_planner.py —
+                                          # giảm xuống = di mịn hơn (đỡ nhảy bậc) nhưng nhiều candidate hơn,
+                                          # tốn CPU hơn (số path sinh ra ~ tỉ lệ nghịch giá trị này)
+    # curve_zone_*: dùng chung cho gps_node (gate curvature feed-forward) và
+    # visualization_node (tô màu đoạn cua trên panel GPS) — PHẢI cùng giá trị
+    # để hình vẽ khớp đúng đoạn feed-forward thật sự kích hoạt.
+    curve_zone_curvature_thresh: 0.05      # |kappa| CSV vượt mức này mới tính là "trong cua" [1/m] (~R<20m)
+    curve_zone_dilate_m: 5.0              # nới rộng mỗi curve zone thêm 2 đầu [m]
+
+encoder_node:
+  ros__parameters:
+    serial_port: /dev/ttyUSB0          # cổng serial hoverboard
+    baud_rate: 115200                   # baudrate serial hoverboard
+    wheel_radius: 0.07               # bán kính bánh xe [m]
+    track_width: 0.3556                  # khoảng cách vệt bánh trái/phải [m]
+    right_wheel_sign: -1.0               # đảo dấu chiều quay bánh phải (nếu encoder lắp ngược)
+    poll_rate_hz: 150.0                  # tần số đọc feedback từ serial hoverboard [Hz]
+    odom_publish_rate_hz: 50.0           # tần số publish /odom + TF [Hz]
+    cmd_vel_timeout: 0.3                 # /cmd_vel cũ hơn giá trị này [s] -> coi là mất kết nối, dừng xe
+    frame_id: odom                       # frame_id cho Odometry/TF
+    child_frame_id: base_link            # child_frame_id cho Odometry/TF
+    publish_tf: true                     # có publish TF odom -> base_link hay không
+    cmd_speed_scale: 50.0                # hệ số quy đổi /cmd_vel linear.x [m/s] -> speed_raw
+    cmd_steer_scale: 26.7                # hệ số quy đổi /cmd_vel angular.z [rad/s] -> steer_raw
+    max_speed_raw: 50                    # giới hạn speed_raw gửi xuống hoverboard
+    max_steer_raw: 40                    # giới hạn steer_raw gửi xuống hoverboard
+
+joy_pygame_node:
+  ros__parameters:
+    joy_topic: /joy                      # topic publish sensor_msgs/Joy
+    poll_rate_hz: 50.0                    # tần số đọc tay cầm PS4 qua pygame [Hz]
+    joystick_index: 0                     # index joystick, dùng khi cắm nhiều tay cầm
+
+control_node:
+  ros__parameters:
+    control_rate_hz: 50.0                # tần số vòng lặp control chính (_control_tick, cmd_vel) [Hz]
+    joy_topic: /joy                      # topic Joy để đọc nút R1 chuyển mode manual/auto
+    r1_button_index: 5                    # index nút R1 trong buttons[] của tay cầm
+    max_linear_speed: 5.0                # giới hạn vận tốc dài khi lái tay [m/s]
+    max_angular_speed: 6.0              # giới hạn vận tốc góc khi lái tay [rad/s]
+    manual_speed_axis: 1                  # index axis ga trên tay cầm (chế độ manual)
+    manual_steer_axis: 2                  # index axis lái trên tay cầm (chế độ manual)
+    manual_invert_speed_axis: true       # đảo chiều giá trị axis ga
+    manual_invert_steer_axis: false      # đảo chiều giá trị axis lái
+    manual_deadzone: 0.15                # vùng chết của axis, tránh trôi khi tay cầm không đụng
+    auto_speed: 1.0                      # vận tốc dài cố định khi chạy auto (pure pursuit) [m/s]
+    lookahead_distance: 0.8             # khoảng cách nhìn trước cho pure pursuit [m] — dùng cho pipeline
+                                          # THẲNG (vision, _planner_tick) — KHÔNG dùng cho curve mode nữa,
+                                          # xem curve_lookahead_distance bên dưới (2 pipeline tách biệt,
+                                          # đổi 1 bên không ảnh hưởng bên kia)
+    pure_pursuit_heading_gain: 0.5       # hệ số bù heading trong pure pursuit
+    track_width: 0.3556                  # khoảng cách vệt bánh, dùng để tính omega -> cmd_vel
+    max_wheel_speed: 1.2                 # giới hạn tốc độ từng bánh sau khi tính differential [m/s]
+    # --- EKF fusion odom + quan sát làn từ perception (xem control/ekf.py) ---
+    ekf_q_s: 0.02                        # process noise của s (quãng đường dọc)
+    ekf_q_d: 0.01                         # process noise của d (lệch ngang khỏi tâm làn)
+    ekf_q_psi: 0.01                       # process noise của psi (heading)
+    ekf_q_v: 0.05                         # process noise của v (vận tốc)
+    ekf_r_d: 0.04                         # measurement noise của d đo từ perception
+    ekf_r_psi: 0.0076154                 # measurement noise của psi đo từ perception (= radians(5°)^2)
+    ekf_r_v: 0.02                        # measurement noise của v đo từ odom
+    planner_rate_hz: 15.0                # tần số planner nội bộ của control_node (_planner_tick) [Hz]
+    # --- Frenet Optimal Planner nội bộ: các plan_* khai báo dùng chung ở khối /** đầu file ---
+    # --- GPS assist (Gps/route_ekf.py) — CHỈ dùng d/psi_err từ GPS khi mất
+    # vision quá lâu VÀ GPS đủ tin cậy; mặc định TẮT (an toàn), xem
+    # control/node.py _planner_tick cho logic chuyển nguồn. GPS không bao
+    # giờ đụng vào lệch ngang khi camera vẫn thấy line. ---
+    gps_assist_enable: True             # bật fallback GPS lúc mất line dài
+    gps_vision_stale_s: 1.0              # camera không correct quá lâu (s) mới coi là mất line
+    gps_max_sigma_d: 0.6                 # sigma_d GPS phải dưới ngưỡng này mới được tin dùng [m]
+    gps_ff_gain: 1.0                     # hệ số nhân kappa_ff (phần tử [4] của /gps/route_state,
+                                          # 0 ngoài curve zone) vào curvature trước clamp; 0.0 = tắt
+                                          # feed-forward mà không tắt cả gps_assist_enable
+    gps_d_gain: 0.3                      # trộn tuyến tính d_for_plan giữa FrenetEKF (0.0) và GPS (1.0);
+                                          # giảm nếu nghi ngờ GPS d lệch (vd encoder trôi trong cua do
+                                          # trượt bánh làm sigma_d không phản ánh đúng độ tin cậy)
+    gps_force_in_curve_zone: true         # false = hệt hành vi cũ (chỉ chuyển GPS+encoder khi MẤT LINE).
+                                          # true = CHỦ ĐỘNG chuyển ngay khi vào 1 curve zone đã ghi nhận
+                                          # trên bản đồ (in_curve_zone, phần tử [5] /gps/route_state),
+                                          # không cần chờ mất line — vẫn phải qua gate sigma_d<gps_max_sigma_d
+    # --- Curve-Frenet mode: reference CONG trong curve zone (control/node.py:
+    # _planner_tick_curve). Khi active thay hẳn cụm d-blend + kappa_ff ở trên:
+    # state (s, d, psi_err) từ RouteEKF (/gps/route_state — s neo tuyến CSV +
+    # encoder, d neo vision lúc vào zone), planner chạy trên spline CSV
+    # (ReferenceCourse), hết zone bàn giao lại vision (FrenetEKF.reset_lateral).
+    curve_frenet_enable: true            # false = hành vi cũ (d-blend + kappa_ff hack) kể cả trong zone
+    curve_lookahead_distance: 1.5        # lookahead RIÊNG cho pure pursuit trong curve mode — 0.8 (dùng
+                                          # chung với thẳng) cho hệ số khuếch đại lateral_error quá mạnh
+                                          # (2/0.8^2≈3.1/m lệch), gây dao động/xoay mạnh khi d lệch cỡ
+                                          # 0.3-1m (bình thường lúc dead-reckon qua cua, không có vision
+                                          # sửa) — đo bằng mô phỏng vòng kín offline, 1.5 hết dao động vọt
+                                          # qua 180°/phân kỳ; còn dư trôi nhỏ ở khúc cua gấp nhất thì tăng
+                                          # thêm hoặc giảm auto_speed qua đoạn đó
+    route_csv: ""                        # rỗng = map/gps_path_2m.csv (dựng ReferenceCourse, cùng file gps_node)
+    curve_course_ds_m: 0.5               # bước sample spline course [m]
+    gps_route_stale_s: 0.5               # /gps/route_state cũ hơn mức này [s] -> không vào/rời curve mode
+    # --- Test bench curve mode: KHÔNG cần GPS/RouteEKF thật của gps_node, chỉ
+    # cần curve_frenet_enable=true để dựng course/matcher tĩnh từ CSV lúc init.
+    # BẬT true = bỏ qua toàn bộ gate GPS thật (in_curve_zone/sigma_d/route
+    # tươi), tự khởi tạo 1 RouteEKF riêng ở đầu curve zone đầu tiên trên tuyến
+    # rồi predict() bằng /odom ENCODER THẬT mỗi tick (không phải tốc độ giả
+    # lập) — đẩy xe thật (tay hoặc chạy thật) để xem s/d/heading reconstruct
+    # qua course có đúng không, ra khỏi zone thì tự lặp lại từ đầu.
+    # Mặc định curve_frenet_test_loop=true: lặp vô hạn, CHỈ dùng lúc xe đứng
+    # yên/đẩy tay xem panel. Nếu auto đang lái thật LIÊN TỤC (không phải chỉ
+    # đẩy tay), mỗi lần lặp là 1 bước s giật lùi ~20m -> auto đổi lệnh lái
+    # đột ngột ("quay ngược") — set curve_frenet_test_loop=false để chạy
+    # ĐÚNG 1 LƯỢT qua zone rồi tự bàn giao lại auto bình thường (thẳng/vision)
+    # như bàn giao thật, không lặp phá driving liên tục. Test lại thì restart
+    # control_node để rearm (xem control/node.py:_advance_test_state).
+    curve_frenet_force_test: true       # true = bench test, KHÔNG dùng khi lái thật
+    curve_frenet_test_loop: false         # false = 1 lượt rồi bàn giao lại auto bình thường
+    curve_frenet_test_d_m: 0.0            # [m] d khởi tạo tại đầu zone (panel convention +=phải)
+    curve_frenet_test_psi_err_deg: 0.0    # [deg] psi_err khởi tạo tại đầu zone (+=phải)
+
+planner_motion_node:
+  ros__parameters:
+    frenet_state_topic: /perception/frenet_state    # topic nhận frenet_state (JSON) từ perception
+    visual_frenet_topic: /perception/visual_frenet  # topic publish optimal_path/candidate_paths cho visualization
+    # --- Frenet Optimal Planner: các plan_* khai báo dùng chung ở khối /** đầu file ---
+
+perception_node:
+  ros__parameters:
+    rgb_topic: /camera/camera/color/image_raw                        # topic ảnh RGB từ RealSense
+    depth_topic: /camera/camera/aligned_depth_to_color/image_raw     # topic depth đã align với RGB
+    camera_info_topic: /camera/camera/color/camera_info              # topic camera_info (để lấy intrinsics)
+    visual_frame_topic: /perception/visual_frame                     # topic publish ảnh đã blend segmentation
+    frenet_state_topic: /perception/frenet_state                     # topic publish frenet_state (JSON) cho planner
+    segmentation_alpha: 0.35             # độ mờ (alpha blend) khi vẽ mask segmentation lên ảnh
+    device: auto                         # thiết bị chạy model: auto/cpu/cuda:0...
+    # yolo_model_path / seg_model_path KHÔNG khai báo ở đây: đường dẫn model
+    # phụ thuộc máy (xem perception/model_paths.py), để trống thì node tự lấy
+    # default theo máy đang chạy. Chỉ set 2 key này nếu cần override đường dẫn.
+    yolo_conf: 0.35                      # ngưỡng confidence YOLO detect
+    yolo_iou: 0.45                       # ngưỡng IoU cho NMS của YOLO
+    seg_conf: 0.35                       # ngưỡng confidence model segmentation
+    seg_x_min: 0.0                       # tỉ lệ trái của vùng ảnh lấy mẫu segmentation (0..seg_x_max)
+    seg_x_max: 2.0                       # tỉ lệ phải của vùng ảnh lấy mẫu segmentation
+    seg_min_area: 500                    # diện tích tối thiểu (px) của 1 blob segmentation để tính là hợp lệ
+    seg_target_class_id: 1               # id class segmentation lấy làm vạch làn (0: curb, 1: dashed_yellow_line)
+    cam_cx: -1.0                         # tâm quang học theo trục x [px], -1 = tự lấy image_w/2
+    seg_y_step: 4                        # khoảng cách lấy mẫu dọc trong mỗi nét đứt của vạch làn [px]
+    frenet_alpha: 0.3                    # trọng số EMA khi lọc mượt phép đo d/heading mới
+    lane_width_m: 2.7                    # bề rộng làn đường giả định [m]
+    depth_scale: 0.001                   # hệ số quy đổi giá trị depth thô -> mét
+    frame_stride: 1                      # xử lý 1 frame rồi bỏ qua (stride-1) frame kế tiếp, giảm tải inference
+    obstacle_alpha: 0.05                 # trọng số EMA khi lọc mượt vị trí vật cản theo thời gian
+    obstacle_track_ttl: 5                # số frame giữ track vật cản khi không match được detection mới
+    obstacle_match_px: 90.0              # ngưỡng khoảng cách pixel để match detection với track cũ
+    obstacle_match_s: 2.0                # ngưỡng khoảng cách theo s (Frenet) để match track [m]
+    obstacle_match_d: 1.2                # ngưỡng khoảng cách theo d (Frenet) để match track [m]
+    obstacle_match_cost_max: 1.35        # cost tối đa cho phép để chấp nhận match track
+    obstacle_depth_percentile: 35.0      # percentile depth trong bbox dùng làm khoảng cách vật cản
+    detection_conf_gate: 0.45            # ngưỡng confidence tối thiểu để 1 detection được coi là vật cản thật
+    seg_viz_all_classes: true            # seg cả 2 class (curb + line): class phụ CHỈ hiển thị (blend ảnh +
+                                          # chấm xanh dương trên panel Frenet 2D), fit d/heading + seg_ratio
+                                          # của detection vẫn chỉ dùng seg_target_class_id; false = như cũ
+
+visualization_node:
+  ros__parameters:
+    visual_frame_topic: /perception/visual_frame      # topic nhận ảnh đã blend segmentation từ perception
+    visual_frenet_topic: /perception/visual_frenet    # topic nhận optimal_path/candidate_paths từ planner
+    overlay_topic: /perception/overlay                # topic publish ảnh overlay debug cuối cùng
+    lane_width_m: 2.7                                  # bề rộng làn đường giả định [m], khớp perception_node
+    use_window: true                                  # có mở cửa sổ cv2.imshow hiển thị trực tiếp hay không
+    window_name: "RGB Dual Model View"                 # tên cửa sổ khi use_window=true
+    # Lưới 2x2 vừa đúng display_width x display_height (mỗi ô = 1 nửa):
+    # [Camera | Frenet/EKF] / [Encoder | GPS]. window_scale=1.0 vì output đã
+    # đúng khít kích thước màn hình, không cần scale thêm (trước đây 0.6 để
+    # thu nhỏ layout hstack 4 panel full-res cũ, giờ không còn nữa).
+    window_scale: 1.0                                  # tỉ lệ scale thêm (1.0 = giữ nguyên display_width/height)
+    display_width: 1280                                # bề rộng cửa sổ tổng [px]
+    display_height: 720                                # chiều cao cửa sổ tổng [px]
+    odom_topic: /odom                                  # topic Odometry để vẽ vệt đường đi encoder
+    ekf_state_topic: /control/ekf_state                # topic [s, d, psi, v] của EKF để vẽ debug
+    planner_viz_topic: /control/planner_viz            # topic path planner nội bộ của control_node để vẽ debug
+    encoder_trail_max_points: 1500                     # số điểm tối đa giữ lại khi vẽ vệt đường đi encoder
+    gps_route_state_topic: /gps/route_state            # topic [s_m, d_m, psi_err, sigma_d, kappa_ff] từ Gps/node.py
+    route_csv: ""                                      # rỗng = map/gps_path_2m.csv mặc định (để vẽ panel GPS)
+    curve_panel_zoom_zone: true                         # panel Frenet lúc curve mode: true = khung nhìn ĐÚNG đoạn cua
+                                                        # đang chạy (waypoint đầu -> cuối của zone, không phải toàn
+                                                        # tuyến 551m); false = vẽ toàn tuyến CSV
+    curve_panel_zone_margin_m: 2.0                      # margin quanh biên zone khi zoom_zone=true [m] — chỉ để
+                                                        # path/xe không bị cắt sát viền panel, không phải context rộng
+
+gps_node:
+  ros__parameters:
+    serial_port: /dev/ttyUSB1            # cổng serial module GPS (khác encoder_node's /dev/ttyUSB0)
+    baud_rate: 230400                    # baudrate UBX
+    serial_timeout: 1.0                  # timeout đọc serial [s]
+    route_csv: ""                        # rỗng = dùng map/gps_path_2m.csv mặc định
+    predict_rate_hz: 50.0                # tần số predict RouteEKF từ /odom [Hz], khớp odom_publish_rate_hz
+    vision_timeout_s: 0.3                # camera im lặng quá mức này -> ngừng anchor_lateral(), để RouteEKF tự dead-reckon
+    odom_topic: /odom
+    ekf_state_topic: /control/ekf_state          # [s,d,psi,v] của FrenetEKF (control_node) dùng để anchor
+    frenet_state_topic: /perception/frenet_state # chỉ dùng để biết vision con "tuoi" hay khong
+    route_state_topic: /gps/route_state          # publish [s_m, d_m, psi_err, sigma_d, kappa_ff] cho control_node
+    # --- RouteEKF (đã tune bằng Gps/sim_route_ekf.py, xem route_ekf.py) ---
+    q_xy: 0.01                           # process noise vị trí [m^2/s] (trôi encoder)
+    q_psi: 0.0002                        # process noise heading [rad^2/s]
+    min_fix_type: 3                      # chỉ nhận GPS fix 3D trở lên
+    max_h_acc_m: 30.0                     # hAcc receiver phải dưới ngưỡng này mới nhận fix
+    default_h_acc_m: 3.0                 # hAcc mặc định nếu receiver không báo
+    gps_gate_chi2: 100.0      # gate Mahalanobis 2 bậc tự do (99%) chặn multipath
+    anchor_sigma_d: 0.15                 # độ tin d/psi từ vision lúc anchor_lateral() [m]
+    project_window_m: 40.0               # cửa sổ tìm kiếm quanh s hiện tại khi chiếu lên tuyến [m]
+    curve_zone_hysteresis_m: 4.0         # trong curve zone, correct_gps() CHẶN HẲN GPS (chỉ tin encoder
+                                          # dead-reckon); margin này chống zone "nhấp nháy" khi s dao động
+                                          # sát biên — đã vào zone thì phải đi xa hơn biên gốc thêm mức này
+                                          # mới coi là ra (xem RouteEKF._update_curve_zone_state)
+    # --- Curvature feed-forward (curve_zone_* dùng chung, xem khối /** đầu file) ---
+    curve_ff_preview_m: 1.5              # nhìn trước s+preview để lấy kappa_ff [m], khớp lookahead_distance
+    # --- Curvature profile (phần tử [6:] của /gps/route_state, xem Gps/node.py:_curve_kappa_profile) ---
+    kappa_profile_len_m: 12.0            # chiều dài profile curvature nhìn trước [m]
+    kappa_profile_step_m: 0.5            # bước lấy mẫu dọc profile curvature [m]

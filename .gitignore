@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+.claude/settings.local.json
+
+# ROS2 colcon build artifacts (install/ is a static copy, never symlinked)
+build/
+install/
+log/
