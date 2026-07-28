@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import csv
 import json
+import time
+from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -65,6 +69,15 @@ class PerceptionNode(Node):
         self.declare_parameter("detection_conf_gate", 0.45)
         self.declare_parameter("seg_viz_all_classes", True)
 
+        # --- Log TIMING perception ra CSV (đo loop-rate/latency THẬT của
+        # image_callback: chu kỳ frame, thời gian inference seg/det, tổng
+        # process_frame, và AGE của frame = now − camera stamp). Ghi MỖI frame
+        # xử lý (không throttle), buffer rồi flush batch. Thống kê/vẽ chung với
+        # timing control_node bằng scripts/plot_loop_timing.py (loop='perception').
+        self.declare_parameter("log_timing_enable", False)
+        self.declare_parameter("log_timing_csv", "")  # rỗng = ~/rl_car_perc_timing_<stamp>.csv
+        self.declare_parameter("log_timing_flush_n", 100)
+
         self.rgb_topic = self.get_parameter("rgb_topic").value
         self.visual_frame_topic = self.get_parameter("visual_frame_topic").value
         self.frenet_state_topic = self.get_parameter("frenet_state_topic").value
@@ -74,6 +87,35 @@ class PerceptionNode(Node):
 
         self.bridge = CvBridge()
         self.frame_count = 0
+
+        # Timing log: image_callback chạy trên 1 callback group MutuallyExclusive
+        # (không đa thread) nên không cần lock — buffer + flush batch đơn giản.
+        self._timing_writer = None
+        self._timing_file = None
+        self._timing_t0: float | None = None
+        self._timing_buf: list[tuple] = []
+        self._timing_last: float | None = None  # mono t frame trước (đo period)
+        self.log_timing_flush_n = max(1, int(self.get_parameter("log_timing_flush_n").value))
+        if bool(self.get_parameter("log_timing_enable").value):
+            tpath = self.get_parameter("log_timing_csv").value
+            if not tpath:
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                tpath = str(Path.home() / f"rl_car_perc_timing_{stamp}.csv")
+            try:
+                self._timing_file = open(tpath, "w", newline="")
+                self._timing_writer = csv.writer(self._timing_file)
+                # loop='perception' để plot_loop_timing gộp chung với control/planner.
+                # period_ms: chu kỳ giữa 2 frame xử lý; seg_ms/det_ms: 2 lần YOLO;
+                # exec_ms: tổng image_callback (convert + process + publish);
+                # frame_age_ms: now − header.stamp = độ trễ frame lúc bắt đầu xử lý.
+                self._timing_writer.writerow(
+                    ["t_s", "loop", "period_ms", "exec_ms", "seg_ms", "det_ms", "frame_age_ms"]
+                )
+                self.get_logger().info(f"Log timing perception -> {tpath}")
+            except OSError as exc:
+                self.get_logger().error(f"Khong mo duoc file timing {tpath}: {exc}")
+                self._timing_writer = None
+
         self._warned_missing_depth = False
         self._warned_missing_cam_info = False
 
@@ -207,11 +249,43 @@ class PerceptionNode(Node):
         self._warned_missing_depth = False
         self._warned_missing_cam_info = False
 
+        # Đo timing CHỈ cho frame thật sự xử lý (đã qua gate depth/cam_info) —
+        # không đếm frame bị bỏ, để period phản ánh đúng nhịp inference.
+        _t_enter = time.monotonic() if self._timing_writer is not None else None
         try:
             result = self.logic.process_frame(bgr, frame_index=self.frame_count)
             self._publish_outputs(msg, result)
         except Exception as exc:
             self.get_logger().error(f"Inference pipeline failed: {exc}")
+            result = None
+        if _t_enter is not None:
+            self._record_timing(_t_enter, msg, result)
+
+    def _record_timing(self, t_enter: float, msg, result) -> None:
+        """Ghi 1 dòng timing perception: period (nhịp frame), exec (tổng
+        image_callback), seg/det (2 lần YOLO từ result), frame_age (now −
+        camera stamp). Buffer rồi flush batch."""
+        t_exit = time.monotonic()
+        if self._timing_t0 is None:
+            self._timing_t0 = t_enter
+        period_ms = "" if self._timing_last is None else f"{(t_enter - self._timing_last) * 1000:.3f}"
+        self._timing_last = t_enter
+        exec_ms = f"{(t_exit - t_enter) * 1000:.3f}"
+        seg_ms = f"{result.seg_ms:.3f}" if result is not None else ""
+        det_ms = f"{result.det_ms:.3f}" if result is not None else ""
+        # Age = now − stamp camera; dùng clock ROS để cùng gốc với header.stamp.
+        stamp = msg.header.stamp
+        stamp_s = stamp.sec + stamp.nanosec * 1e-9
+        now_s = self.get_clock().now().nanoseconds * 1e-9
+        age_ms = f"{(now_s - stamp_s) * 1000:.3f}" if stamp_s > 0 else ""
+        self._timing_buf.append(
+            (f"{t_enter - self._timing_t0:.4f}", "perception", period_ms, exec_ms,
+             seg_ms, det_ms, age_ms)
+        )
+        if len(self._timing_buf) >= self.log_timing_flush_n:
+            self._timing_writer.writerows(self._timing_buf)
+            self._timing_buf.clear()
+            self._timing_file.flush()
 
     def _publish_outputs(self, input_msg: Image, result) -> None:
         frame_msg = self.bridge.cv2_to_imgmsg(result.visual_frame, encoding="bgr8")
@@ -237,6 +311,18 @@ class PerceptionNode(Node):
         coeffs_msg = Float64MultiArray()
         coeffs_msg.data = result.coeffs
         self.frenet_coeffs_pub.publish(coeffs_msg)
+
+    def destroy_node(self) -> bool:
+        # Flush nốt buffer timing còn dở rồi đóng file.
+        if self._timing_writer is not None:
+            try:
+                if self._timing_buf:
+                    self._timing_writer.writerows(self._timing_buf)
+                    self._timing_buf.clear()
+                self._timing_file.close()
+            except OSError:
+                pass
+        return super().destroy_node()
 
 
 def main(args: list[str] | None = None) -> None:

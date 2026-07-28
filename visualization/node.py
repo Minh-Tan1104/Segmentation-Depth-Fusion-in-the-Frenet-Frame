@@ -45,11 +45,15 @@ class VisualizationNode(Node):
         self.declare_parameter("planner_viz_topic", "/control/planner_viz")
         self.declare_parameter("encoder_trail_max_points", 1500)
         self.declare_parameter("gps_route_state_topic", "/gps/route_state")
-        self.declare_parameter("route_csv", "")  # rỗng = map/gps_path_2m.csv mặc định
+        self.declare_parameter("route_csv", "")  # rỗng = map/gps_log.csv mặc định
         # Cùng key với gps_node (khai báo ở khối /** trong yaml) để zone vẽ ra
         # khớp đúng đoạn cua mà gps_node dùng cho curvature feed-forward.
         self.declare_parameter("curve_zone_curvature_thresh", 0.05)
-        self.declare_parameter("curve_zone_dilate_m", 4.0)
+        # List [zone0, zone1, ...] theo thứ tự cua dọc tuyến; 1 phần tử = áp
+        # chung. Xem RouteMapMatcher.detect_curve_zones — PHẢI khớp gps_node
+        # để đoạn cua tô màu trên panel khớp đúng đoạn feed-forward thật.
+        self.declare_parameter("curve_zone_dilate_before_m", [4.0])
+        self.declare_parameter("curve_zone_dilate_after_m", [4.0])
         # Panel Frenet khi control_node đang ở curve mode (curve_frame trong
         # planner_viz): mặc định true = khung nhìn ĐÚNG đoạn cua đang chạy
         # (waypoint đầu -> waypoint cuối của curve zone chứa xe, không phải
@@ -86,7 +90,7 @@ class VisualizationNode(Node):
         else:
             from ament_index_python.packages import get_package_share_directory
             from pathlib import Path
-            route_csv_path = Path(get_package_share_directory("RL_CAR")) / "map" / "gps_path_2m.csv"
+            route_csv_path = Path(get_package_share_directory("RL_CAR")) / "map" / "gps_log.csv"
         try:
             self._gps_matcher: RouteMapMatcher | None = RouteMapMatcher(route_csv_path)
         except Exception as exc:
@@ -95,7 +99,8 @@ class VisualizationNode(Node):
         self._gps_curve_zones: list[tuple[float, float]] = (
             self._gps_matcher.detect_curve_zones(
                 curvature_thresh=float(self.get_parameter("curve_zone_curvature_thresh").value),
-                dilate_m=float(self.get_parameter("curve_zone_dilate_m").value),
+                dilate_before_m=list(self.get_parameter("curve_zone_dilate_before_m").value),
+                dilate_after_m=list(self.get_parameter("curve_zone_dilate_after_m").value),
             )
             if self._gps_matcher is not None
             else []
@@ -239,6 +244,13 @@ class VisualizationNode(Node):
         # curve mode, xem control/node.py:_planner_tick_curve).
         control_panel = np.full((cell_h, cell_w, 3), 18, dtype=np.uint8)
         pv = self._latest_planner_viz
+        # detections: perception_node đo 1 lần, planner_motion_node chỉ pass-
+        # through nguyên vẹn qua /perception/visual_frenet (self._latest_payload)
+        # — cùng dữ liệu vật cản thật bất kể control_node đang chạy planner nào,
+        # nên dùng lại được cho panel control (trước đây truyền [] rỗng, chấm
+        # đỏ vật cản không bao giờ hiện ở panel này dù draw_frenet_panel đã vẽ
+        # sẵn logic đó).
+        detections = (self._latest_payload or {}).get("detections", [])
         if (
             pv is not None
             and pv.get("curve_frame")
@@ -253,7 +265,7 @@ class VisualizationNode(Node):
             )
         else:
             self.renderer.draw_frenet_panel(
-                control_panel, pv, [], pad, pad,
+                control_panel, pv, detections, pad, pad,
                 cell_w - 2 * pad, cell_h - 2 * pad, title="Frenet/EKF (control)",
             )
 

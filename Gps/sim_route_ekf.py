@@ -1,4 +1,4 @@
-"""Mô phỏng offline kiểm chứng RouteEKF trên tuyến thật (map/gps_path_2m.csv).
+"""Mô phỏng offline kiểm chứng RouteEKF trên tuyến thật (map/gps_log.csv).
 
 Kịch bản: xe chạy đúng tim tuyến 1.5 m/s; encoder có bias thực tế (v lệch 2%,
 omega lệch 5% + nhiễu); GPS 1 Hz nhiễu 2 m RMS; các khúc cua (dò tự động từ
@@ -23,7 +23,7 @@ import numpy as np
 from map_matcher import RouteMapMatcher
 from route_ekf import RouteEKF, RouteEKFConfig
 
-ROUTE_CSV = Path(__file__).resolve().parent.parent / "map" / "gps_path_2m.csv"
+ROUTE_CSV = Path(__file__).resolve().parent.parent / "map" / "gps_log.csv"
 
 DT = 0.02              # 50 Hz predict (khớp odom_publish_rate_hz)
 V_TRUE = 1.5           # m/s
@@ -47,7 +47,9 @@ def detect_blind_zones(matcher: RouteMapMatcher) -> list[tuple[float, float]]:
     Gps/node.py (production) thay vì giữ 2 bản riêng dễ trôi nhau.
     """
     return matcher.detect_curve_zones(
-        curvature_thresh=CURVE_CURV_THRESH, dilate_m=CURVE_DILATE_M
+        curvature_thresh=CURVE_CURV_THRESH,
+        dilate_before_m=CURVE_DILATE_M,
+        dilate_after_m=CURVE_DILATE_M,
     )
 
 

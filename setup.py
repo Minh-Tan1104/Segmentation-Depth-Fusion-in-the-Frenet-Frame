@@ -19,7 +19,7 @@ setup(
     zip_safe=True,
     maintainer="minh_tan",
     maintainer_email="khoa16042003@gmail.com",
-    description="Perception (seg làn + Frenet + detection) -> planner (Frenet Optimal) -> visualization cho xe tự hành.",
+    description="Perception (lane segmentation + Frenet + detection) -> planner (Frenet Optimal) -> visualization for a self-driving car.",
     license="MIT",
     entry_points={
         "console_scripts": [

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -52,6 +53,10 @@ class FrameResult:
     d_meters_filtered: float | None
     heading_filtered: float | None
     coeffs: list[float] = field(default_factory=list)
+    # Timing 2 lần YOLO tách riêng [ms] — node.py ghi ra CSV khi log_timing_enable.
+    # Đo bằng perf_counter quanh self.seg.predict / self.yolo.predict.
+    seg_ms: float = 0.0
+    det_ms: float = 0.0
 
 
 class PerceptionLogic:
@@ -169,16 +174,22 @@ class PerceptionLogic:
         depth_img = self._depth_img
         cam_intr = self._cam_intr
 
+        # perf_counter quanh 2 lần YOLO (seg + det) để đo tải inference THẬT
+        # tách riêng — GPU nên bao gồm cả kernel launch + copy, đúng cái xe chịu.
+        _t_seg0 = time.perf_counter()
         seg_mask, seg_mask_viz, seg_color, segmentation_meta, frenet = (
             self._run_yolo_segmentation(bgr, depth_img, cam_intr)
         )
+        seg_ms = (time.perf_counter() - _t_seg0) * 1000.0
         # Không có làn không có nghĩa là không có gì để publish — ảnh
         # (visual_frame) và detection vật cản vẫn hợp lệ độc lập với làn.
         # Chỉ phần Frenet/lane sẽ là None.
         self._update_frenet(frenet)
         # detection dùng seg_mask (target-only) — seg_ratio không đổi khi bật
         # seg_viz_all_classes; blend ảnh dùng seg_mask_viz (cả class phụ).
+        _t_det0 = time.perf_counter()
         detections = self._run_yolo_detection(bgr, seg_mask, depth_img, cam_intr, frenet)
+        det_ms = (time.perf_counter() - _t_det0) * 1000.0
         visual_frame = self._build_visual_frame(bgr, seg_mask_viz, seg_color)
         frenet_viz = self._build_frenet_viz(frenet) if frenet is not None else None
 
@@ -190,6 +201,8 @@ class PerceptionLogic:
             d_meters_filtered=self._d_m_raw,
             heading_filtered=self._hdg_raw,
             coeffs=list(frenet.get("coeffs", [])) if frenet is not None else [],
+            seg_ms=seg_ms,
+            det_ms=det_ms,
         )
 
     def _run_yolo_segmentation(

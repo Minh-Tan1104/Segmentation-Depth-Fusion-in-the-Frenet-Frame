@@ -170,16 +170,43 @@ class RouteMapMatcher:
         hi = self.total_length_m if s_hi is None else s_hi
         return self._project(x, y, lo, hi)
 
+    @staticmethod
+    def _pick_dilate(val, i: int) -> float:
+        """Lấy giá trị dilate cho zone thứ i. val có thể là:
+        - scalar (float/int): áp CHUNG cho mọi zone (hành vi cũ).
+        - list/array: áp RIÊNG theo index zone (thứ tự dọc tuyến, s tăng dần);
+          nếu i vượt độ dài list thì dùng phần tử CUỐI (list ngắn hơn số zone
+          -> các zone dư dùng giá trị cuối). List rỗng -> 0.0.
+        """
+        if isinstance(val, (int, float)):
+            return float(val)
+        seq = list(val)
+        if not seq:
+            return 0.0
+        return float(seq[i] if i < len(seq) else seq[-1])
+
     def detect_curve_zones(
         self,
         curvature_thresh: float = 0.05,
-        dilate_m: float = 4.0,
+        dilate_before_m=4.0,
+        dilate_after_m=4.0,
         n_samples: int = 400,
         smooth_window: int = 7,
     ) -> list[tuple[float, float]]:
         """Tìm các đoạn [s_start, s_end] có độ cong lớn (dùng để trigger chế độ
         "mất vision lúc rẽ": GpsNode chỉ anchor_lateral() từ vision khi NGOÀI
         các đoạn này). curvature_thresh tính bằng rad/m (0.05 ~ bán kính < 20m).
+        dilate_before_m/dilate_after_m nới rộng biên KHÔNG ĐỐI XỨNG: before
+        nới về phía s NHỎ HƠN (trigger zone SỚM HƠN, trước khi vào cua thật —
+        đủ thời gian anchor/chuyển mode trước khi curvature thực sự tăng);
+        after nới về phía s LỚN HƠN (giữ zone thêm sau khi cua hình học đã
+        hết — biên độ an toàn phòng GPS/encoder trôi nhẹ lúc sắp ra cua).
+
+        Mỗi tham số nhận scalar (áp chung) HOẶC list (áp RIÊNG theo từng zone,
+        index = thứ tự cua dọc tuyến s tăng dần — vd [10.0, 3.0] = cua đầu nới
+        10m, cua sau nới 3m). Xem _pick_dilate(). Dilation áp SAU khi dò xong
+        các đoạn cong thô (để index zone ổn định, không phụ thuộc dilation),
+        rồi mới merge các zone chồng lấn.
         Kiểm chứng bằng Gps/sim_route_ekf.py trên map/gps_path_2m.csv.
         """
         ss = np.linspace(0.0, self.total_length_m, n_samples)
@@ -190,7 +217,8 @@ class RouteMapMatcher:
             kernel = np.ones(smooth_window) / smooth_window
             curv = np.convolve(curv, kernel, mode="same")
 
-        zones: list[tuple[float, float]] = []
+        # 1) Dò các đoạn cong THÔ (chưa nới) để cố định thứ tự/index zone.
+        raw: list[tuple[float, float]] = []
         in_zone = False
         start = 0.0
         for s, c in zip(ss, curv):
@@ -198,10 +226,20 @@ class RouteMapMatcher:
                 in_zone, start = True, s
             elif c <= curvature_thresh and in_zone:
                 in_zone = False
-                zones.append((max(0.0, start - dilate_m), s + dilate_m))
+                raw.append((start, s))
         if in_zone:
-            zones.append((max(0.0, start - dilate_m), self.total_length_m))
+            raw.append((start, self.total_length_m))
 
+        # 2) Nới biên theo từng zone (before/after riêng cho zone i).
+        zones = [
+            (
+                max(0.0, a - self._pick_dilate(dilate_before_m, i)),
+                b + self._pick_dilate(dilate_after_m, i),
+            )
+            for i, (a, b) in enumerate(raw)
+        ]
+
+        # 3) Merge các zone chồng lấn sau khi nới.
         merged: list[tuple[float, float]] = []
         for z in zones:
             if merged and z[0] <= merged[-1][1]:

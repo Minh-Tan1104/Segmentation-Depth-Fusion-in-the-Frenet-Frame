@@ -11,10 +11,15 @@ Phân vai 2 tầng (xem thảo luận thiết kế):
     chính xác, còn GPS dễ multipath/che khuất đúng lúc rẽ; ra khỏi zone GPS
     lại kéo về chống trôi như bình thường.
 
-Dùng lúc CUA MẤT VISION: khi vào cua, anchor_lateral() chốt lệch ngang/heading
-từ lần vision tốt cuối; trong cua route_state() trả (s, d, psi_err) so với
-hình học tuyến CSV (chính xác tuyệt đối) để pure pursuit bám tiếp. Ra cua,
-camera thấy line lại thì tầng 1 tự re-anchor, tầng 2 quay về vai trò nền.
+Dùng lúc CUA MẤT VISION: ĐÚNG tại cạnh lên của curve zone, anchor_lateral()
+chốt lệch ngang/heading từ lần vision tốt cuối làm ĐIỀU KIỆN ĐẦU; suốt phần
+còn lại của cua route_state() trả (s, d, psi_err) so với hình học tuyến CSV
+(chính xác tuyệt đối) để pure pursuit bám tiếp, nguồn duy nhất là encoder.
+Ra cua, camera thấy line lại thì tầng 1 tự re-anchor, tầng 2 quay về vai trò nền.
+
+VISION KHÔNG BAO GIỜ correct state ngoài thời điểm neo đó — ngoài curve zone
+tầng 2 là GPS + encoder THUẦN. Xem anchor_lateral() và Gps/node.py
+(anchor_on_curve_entry_only) để biết vì sao gọi lặp mỗi tick là sai.
 
 Quy ước dấu tại biên (khớp "panel" trong control/ekf.py):
   - d > 0  = xe lệch sang PHẢI so với chiều đi của tuyến.
@@ -78,6 +83,11 @@ class RouteEKFConfig:
     # zone thì vẫn dùng đúng biên gốc để vào) — tránh zone "nhấp nháy" on/off
     # mỗi tick khi s ước lượng dao động sát biên do nhiễu GPS/encoder.
     curve_zone_hysteresis_m: float = 2.0
+    # true (mặc định) = CHẶN HẲN correct_gps() khi đang trong curve zone (như
+    # cũ: chỉ tin encoder dead-reckon qua cua). false = VẪN CHO PHÉP GPS
+    # correct_gps() trong curve zone (GPS vẫn phải qua gate min_fix_type,
+    # max_h_acc_m, Mahalanobis bình thường).
+    curve_zone_block_gps: bool = True
 
 
 class RouteEKF:
@@ -211,7 +221,7 @@ class RouteEKF:
             return False, f"fix_type={fix_type} < {self.config.min_fix_type}"
         if h_acc_m is not None and h_acc_m > self.config.max_h_acc_m:
             return False, f"hAcc={h_acc_m:.1f}m > {self.config.max_h_acc_m}m"
-        if self._in_zone_state:
+        if self._in_zone_state and self.config.curve_zone_block_gps:
             return False, "in-curve-zone (GPS bi chan, chi tin encoder)"
 
         sigma = self.config.default_h_acc_m if h_acc_m is None else max(0.5, h_acc_m)
@@ -240,7 +250,15 @@ class RouteEKF:
         return True, "ok"
 
     def anchor_lateral(self, d_m: float, psi_err: float) -> None:
-        """Chốt lệch ngang + heading từ vision (gọi lúc VÀO cua, khi camera còn line).
+        """Chốt lệch ngang + heading từ vision — ĐIỀU KIỆN ĐẦU cho đoạn cua.
+
+        Đây là phép GÁN ĐÈ state (không phải Kalman update): x/P bị ghi thẳng,
+        không qua gate Mahalanobis nào. Vì vậy CHỈ ĐƯỢC GỌI ĐÚNG 1 LẦN tại
+        CẠNH LÊN của curve zone (ngoài -> trong), lúc camera còn thấy line và
+        giá trị của nó còn nghĩa. Gọi lặp mỗi tick (hành vi cũ của Gps/node.py)
+        làm một mẫu segmentation nhảy làn dịch ngang pose tức thời và reset P
+        liên tục -> sigma_d báo "rất chắc chắn" một cách giả tạo. Xem
+        Gps/node.py (anchor_on_curve_entry_only) + docstring đầu file đó.
 
         Giữ nguyên thành phần dọc tuyến (s) — chỉ vision mới đủ tin để sửa ngang.
         d_m/psi_err theo quy ước panel như route_state().

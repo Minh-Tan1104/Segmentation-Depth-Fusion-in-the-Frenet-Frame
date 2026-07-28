@@ -5,10 +5,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This is the `RL_CAR` ament_python ROS2 package. When built as part of a ROS2
 workspace, this directory is normally checked out under `<workspace>/src/`
 (e.g. `~/ros2_ws/src/RL_CAR`) — adjust the workspace-root paths in the
-commands below to match wherever this repo is cloned. A full architecture
-writeup already exists in [README.md](README.md) (Vietnamese) — read it
-before making non-trivial changes; this file only adds what the README
-doesn't (commands + a terse orientation map).
+commands below to match wherever this repo is cloned. [README.md](README.md)
+has a project overview; a full architecture writeup already exists in
+[docs/ARCHITECTURE.vi.md](docs/ARCHITECTURE.vi.md) (Vietnamese) — read it
+before making non-trivial changes; this file only adds what those don't
+(commands + a terse orientation map).
 
 ## What this is
 
@@ -146,21 +147,47 @@ planner_motion_node (parallel Frenet planner, viz/rosbag only — NOT in the dri
 - `frenet_optimal_trajectory.py` at the package root (curved cubic-spline
   reference planner) is an **offline reference tool**, not part of the live
   ROS pipeline.
-- `Encoder/encoder_odom.py`, `Encoder/speed_control.py`,
-  `Encoder/wireless.py`, `Gps/Gps.py` are standalone
-  debug/offline scripts, not run as part of the stack —
-  `encoder_odom.py` imports a nonexistent `control_speed` module and will
-  error if run.
+- `Gps/Gps.py` is a standalone debug/offline script (quick satellite-fix
+  viewer), not run as part of the stack.
 - `k_d` (`plan_center_weight`) is shared between the lane-centering and
   speed-tracking cost terms in the planner — you cannot tighten lane
   centering without also tightening speed tracking without editing
   `frenet_planner.py` itself.
-- `Gps/node.py`'s `anchor_lateral()` call must stay gated on
-  `not self.route_ekf.in_curve_zone`. Inside a curve zone, `control_node`
-  blocks vision from correcting `FrenetEKF` (curve mode owns steering), so
-  `/control/ekf_state` is just FrenetEKF's straight-frame dead-reckoning
-  drifting with the curve's actual curvature — anchoring RouteEKF to that
-  every tick feeds it garbage and corrupts `/gps/route_state` mid-curve
-  (small drift near zone entry, growing drift near the middle — this was a
-  real bug, confirmed by the bench-test mode tracking cleanly while the real
-  GPS path didn't).
+- **Vision must never correct `RouteEKF` during normal operation.** Tier 2 is
+  GPS + encoder only; `Gps/node.py` calls `anchor_lateral()` exactly **once**,
+  on the curve zone's **rising edge**, purely as the initial condition for
+  that curve (`anchor_on_curve_entry_only`, default true). Two reasons:
+  - `anchor_lateral()` is a raw **state overwrite** (`self.x` assigned, `P`
+    reset) with no Kalman gain and no Mahalanobis gate — unlike
+    `correct_gps()`, which passes three. Calling it every tick let a single
+    lane-switch segmentation sample teleport the pose: measured **2.95 m in
+    one sample** while the encoder moved 0.088 m and GPS sat still.
+  - Resetting `P` each tick pinned `sigma_d` at the configured
+    `anchor_sigma_d` (0.15 m), so it reported high confidence exactly where
+    the estimate was jumping metres. That fake value passed `control_node`'s
+    `gps_max_sigma_d` gate. With entry-only anchoring `sigma_d` tracks
+    reality (~1.8 m outside curves in sim) — **re-tune `gps_max_sigma_d`
+    accordingly**, or `_use_gps_route()` will stop trusting GPS entirely.
+  Inside a zone, never anchor at all: `control_node` blocks vision from
+  correcting `FrenetEKF` there (curve mode owns steering), so
+  `/control/ekf_state` is just straight-frame dead-reckoning drifting with
+  the curve's curvature — anchoring to it corrupts `/gps/route_state`
+  mid-curve (this was a real bug, confirmed by the bench-test mode tracking
+  cleanly while the real GPS path didn't).
+- `Gps/sim_route_ekf.py` only exercises `map_matcher.py` + `route_ekf.py` —
+  it never imports `node.py`, so it does **not** cover the anchor scheduling
+  above (the sim always anchored on the rising edge, which is why it kept
+  passing while the real node jumped). It also currently **FAILs** on
+  `map/gps_log.csv` (`max|d|` 1.17 m vs the 1.0 m bar, encoder-only stress
+  1.45 m vs 1.2 m) while PASSing on the old `map/gps_path_2m.csv` — the
+  thresholds were tuned for the old route and were never re-tuned after the
+  waypoint file switched.
+
+## Analysis scripts
+
+Offline plotting helpers over recorded run CSVs (see `scripts/`):
+
+```bash
+python3 scripts/plot_dheading_compare.py "$(ls -t ~/rl_car_dheading_*.csv | head -1)"
+python3 scripts/plot_run_map.py "$(ls -t ~/rl_car_run_*.csv | head -1)" --gt map/gps_log.csv
+```

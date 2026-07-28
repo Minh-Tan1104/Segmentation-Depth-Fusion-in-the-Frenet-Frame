@@ -58,11 +58,13 @@ Curve-Frenet mode (curve_frenet_enable): trong curve zone, thay toàn bộ cụm
 """
 from __future__ import annotations
 
+import csv
 import enum
 import json
 import math
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -152,13 +154,16 @@ class ControlNode(Node):
         # lookahead_distance (dùng cho pipeline thẳng/vision) — xem
         # curve_pp_cfg dưới đây + docstring rl_car_params.yaml.
         self.declare_parameter("curve_lookahead_distance", 1.5)
-        self.declare_parameter("route_csv", "")  # rỗng = map/gps_path_2m.csv
+        self.declare_parameter("route_csv", "")  # rỗng = map/gps_log.csv
         self.declare_parameter("curve_course_ds_m", 0.5)
         self.declare_parameter("gps_route_stale_s", 0.5)
         # curve_zone_* dùng chung (khối /** trong yaml) để tìm curve zone đầu
         # tiên làm sân test — không liên quan gate GPS thật (_curve_mode_data_ok).
         self.declare_parameter("curve_zone_curvature_thresh", 0.05)
-        self.declare_parameter("curve_zone_dilate_m", 4.0)
+        # List [zone0, zone1, ...] theo thứ tự cua dọc tuyến; 1 phần tử = áp
+        # chung. Xem RouteMapMatcher.detect_curve_zones.
+        self.declare_parameter("curve_zone_dilate_before_m", [4.0])
+        self.declare_parameter("curve_zone_dilate_after_m", [4.0])
         # --- Test bench curve mode (KHÔNG cần GPS/RouteEKF thật của gps_node,
         # nhưng VẪN dùng /odom encoder THẬT để tích phân s/d/psi_err) ---
         # true: bỏ qua toàn bộ gate GPS (in_curve_zone/sigma_d/route tươi),
@@ -178,6 +183,27 @@ class ControlNode(Node):
         # làn cua" như 1 phần của auto lái liên tục thật, không cần GPS. Muốn
         # test lại thì restart control_node (rearm zone test).
         self.declare_parameter("curve_frenet_test_loop", True)
+        # --- Ghi log so sánh (d, heading) 3 nguồn ra CSV để vẽ đồ thị offline ---
+        # Bật để lưu (mỗi log_compare_rate_hz, chỉ trên đoạn THẲNG — không
+        # curve mode) 3 cặp (d, heading) cùng quy ước vision (d_meters +=line
+        # bên phải xe, heading độ): (1) EKF fused, (2) vision thuần (đo trực
+        # tiếp perception), (3) encoder thuần (1 FrenetEKF thứ 2 CHỈ predict()
+        # từ /odom, seed 1 lần từ vision đầu, không bao giờ correct — cho thấy
+        # trôi dead-reckon). Vẽ lại bằng scripts/plot_dheading_compare.py.
+        self.declare_parameter("log_compare_enable", False)
+        self.declare_parameter("log_compare_csv", "")  # rỗng = tự đặt tên theo timestamp
+        self.declare_parameter("log_compare_rate_hz", 20.0)
+
+        # --- Ghi log TIMING vòng điều khiển ra CSV (đo loop-rate/jitter THẬT) ---
+        # Khác log_compare (throttle 20Hz): cái này ghi MỖI tick, không throttle,
+        # đo period thật giữa 2 lần gọi cùng timer + thời gian thực thi callback.
+        # 1 dòng/tick cho cả 2 timer (_control_tick 50Hz, _planner_tick 15Hz),
+        # cột 'loop' phân biệt. Vẽ/thống kê bằng scripts/plot_loop_timing.py.
+        # Buffer trong RAM rồi flush theo batch (log_timing_flush_n dòng) để I/O
+        # đĩa không tự làm nhiễu chính phép đo timing.
+        self.declare_parameter("log_timing_enable", False)
+        self.declare_parameter("log_timing_csv", "")  # rỗng = ~/rl_car_timing_<stamp>.csv
+        self.declare_parameter("log_timing_flush_n", 200)
 
         self.joy_topic = self.get_parameter("joy_topic").value
         self.r1_button_index = int(self.get_parameter("r1_button_index").value)
@@ -230,6 +256,73 @@ class ControlNode(Node):
         # EKF được đọc/ghi từ 2 timer khác nhau (_control_tick + _planner_tick,
         # 2 callback group riêng trên MultiThreadedExecutor) -> cần lock.
         self._ekf_lock = threading.Lock()
+
+        # FrenetEKF thứ 2 CHỈ dùng cho log so sánh: predict() từ /odom mỗi tick
+        # (encoder thuần), seed 1 lần từ vision đầu, KHÔNG BAO GIỜ correct() —
+        # cho thấy dead-reckon encoder trôi thế nào so với EKF fused / vision.
+        # Cùng tham số Q với ekf chính để so sánh công bằng. Dùng chung
+        # _ekf_lock (chỉ đụng trong _control_tick predict + _frenet_state_cb seed).
+        self._enc_ekf = FrenetEKF(
+            q_s=float(self.get_parameter("ekf_q_s").value),
+            q_d=float(self.get_parameter("ekf_q_d").value),
+            q_psi=float(self.get_parameter("ekf_q_psi").value),
+            q_v=float(self.get_parameter("ekf_q_v").value),
+            r_d=float(self.get_parameter("ekf_r_d").value),
+            r_psi=float(self.get_parameter("ekf_r_psi").value),
+            r_v=float(self.get_parameter("ekf_r_v").value),
+        )
+        self._enc_seeded = False
+        self._latest_vision: tuple[float, float, float] | None = None  # (d_meters, heading_deg, mono_t)
+
+        # Mở file CSV log so sánh nếu bật (xem log_compare_* params). Chỉ
+        # _control_tick ghi (1 luồng writer duy nhất) -> không cần lock file.
+        self._log_writer = None
+        self._log_file = None
+        self._log_t0: float | None = None
+        self._log_last_write = 0.0
+        self.log_compare_rate_hz = max(1.0, float(self.get_parameter("log_compare_rate_hz").value))
+        if bool(self.get_parameter("log_compare_enable").value):
+            log_path = self.get_parameter("log_compare_csv").value
+            if not log_path:
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                log_path = str(Path.home() / f"rl_car_dheading_{stamp}.csv")
+            try:
+                self._log_file = open(log_path, "w", newline="")
+                self._log_writer = csv.writer(self._log_file)
+                self._log_writer.writerow([
+                    "t_s", "mode", "vision_fresh",
+                    "ekf_d", "ekf_heading_deg",
+                    "vision_d", "vision_heading_deg",
+                    "enc_d", "enc_heading_deg",
+                ])
+                self.get_logger().info(f"Log so sanh (d,heading) -> {log_path}")
+            except OSError as exc:
+                self.get_logger().error(f"Khong mo duoc file log {log_path}: {exc}")
+                self._log_writer = None
+
+        # --- Timing log: mở file + state đo period/exec cho từng timer ---
+        self._timing_writer = None
+        self._timing_file = None
+        self._timing_t0: float | None = None
+        self._timing_buf: list[tuple] = []
+        self._timing_last: dict[str, float] = {}  # loop -> mono t lần gọi trước
+        self._timing_lock = threading.Lock()  # 2 timer ghi buffer từ 2 thread
+        self.log_timing_flush_n = max(1, int(self.get_parameter("log_timing_flush_n").value))
+        if bool(self.get_parameter("log_timing_enable").value):
+            tpath = self.get_parameter("log_timing_csv").value
+            if not tpath:
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                tpath = str(Path.home() / f"rl_car_timing_{stamp}.csv")
+            try:
+                self._timing_file = open(tpath, "w", newline="")
+                self._timing_writer = csv.writer(self._timing_file)
+                # loop: ten timer; period_ms: khoang cach toi lan goi TRUOC cua
+                # cung timer (chu ky THAT); exec_ms: thoi gian chay callback.
+                self._timing_writer.writerow(["t_s", "loop", "period_ms", "exec_ms"])
+                self.get_logger().info(f"Log timing vong dieu khien -> {tpath}")
+            except OSError as exc:
+                self.get_logger().error(f"Khong mo duoc file timing {tpath}: {exc}")
+                self._timing_writer = None
 
         self.planner_logic = PlannerLogic(
             plan_enable=bool(self.get_parameter("plan_enable").value),
@@ -294,7 +387,7 @@ class ControlNode(Node):
                 csv_path = (
                     Path(route_csv)
                     if route_csv
-                    else Path(get_package_share_directory("RL_CAR")) / "map" / "gps_path_2m.csv"
+                    else Path(get_package_share_directory("RL_CAR")) / "map" / "gps_log.csv"
                 )
                 # GIỮ matcher: /gps/route_state (s, d, psi_err) đo so với
                 # POLYLINE của matcher này (RouteEKF cũng dựng từ cùng CSV).
@@ -318,7 +411,12 @@ class ControlNode(Node):
                     curvature_thresh=float(
                         self.get_parameter("curve_zone_curvature_thresh").value
                     ),
-                    dilate_m=float(self.get_parameter("curve_zone_dilate_m").value),
+                    dilate_before_m=list(
+                        self.get_parameter("curve_zone_dilate_before_m").value
+                    ),
+                    dilate_after_m=list(
+                        self.get_parameter("curve_zone_dilate_after_m").value
+                    ),
                 )
                 self._test_zone = test_zones[0] if test_zones else (0.0, self._course.total_length_m)
                 # RouteEKF riêng cho test bench: predict() bằng /odom THẬT
@@ -448,6 +546,18 @@ class ControlNode(Node):
         psi_meas_deg = frenet_viz.get("heading_filtered")
         if d_meas is None or psi_meas_deg is None:
             return
+
+        # Lưu vision thuần cho log so sánh (luôn luôn, kể cả lúc curve/GPS mode
+        # bỏ qua correct bên dưới — vẫn muốn ghi giá trị vision đo được). Seed
+        # _enc_ekf 1 lần từ vision đầu tiên để encoder-only bắt đầu KHỚP vision
+        # rồi dead-reckon (thấy trôi rõ). Convention EKF: d = -d_meters,
+        # psi = radians(heading) -> seed reset_lateral(-d_meters, radians(hdg)).
+        self._latest_vision = (float(d_meas), float(psi_meas_deg), time.monotonic())
+        if self._log_writer is not None and not self._enc_seeded:
+            with self._ekf_lock:
+                self._enc_ekf.reset_lateral(-float(d_meas), math.radians(float(psi_meas_deg)))
+            self._enc_seeded = True
+
         # Timestamp cập nhật TRƯỚC khi xét _use_gps_route() — camera vẫn
         # đang thấy line thật (vision không "stale"), dù có thể đang bị bỏ
         # qua bên dưới. Nhờ vậy ra khỏi cua/hết ép GPS là vision được tin
@@ -739,6 +849,15 @@ class ControlNode(Node):
         Trong curve zone (curve_frenet_enable): rẽ sang _planner_tick_curve
         (reference cong từ CSV); ra khỏi zone thì bàn giao FrenetEKF lại cho
         vision trước khi chạy tiếp nhánh thẳng."""
+        _tt = self._tick_enter("planner")
+        try:
+            self._planner_tick_body()
+        finally:
+            self._tick_exit(_tt)
+
+    def _planner_tick_body(self) -> None:
+        """Thân thật của _planner_tick — tách ra để _planner_tick bọc timing
+        (try/finally) bao trọn mọi nhánh return sớm bên dưới."""
         if self._curve_mode_active():
             self._curve_mode_prev = True
             self._planner_tick_curve()
@@ -800,6 +919,19 @@ class ControlNode(Node):
                 ff_curvature = self.gps_ff_gain * kappa_ff
         c_d_d = c_speed * math.sin(psi_for_plan)
 
+        # Debug: in d/heading (FrenetEKF, chế độ thẳng) + x_m/z_m từng vật cản
+        # detect được ra terminal (throttle để không spam ở 15Hz).
+        obs_str = ", ".join(
+            f"[{det.get('label', '?')} x={fr.get('x_m_filtered', fr.get('x_m')):.2f}m "
+            f"z={fr.get('z_m_filtered', fr.get('z_m')):.2f}m]"
+            for det in self._latest_detections
+            if (fr := det.get("frenet")) and fr.get("available")
+        ) or "(khong co vat can)"
+        self.get_logger().info(
+            f"[THANG] d={d_for_plan:+.3f}m heading={math.degrees(psi_for_plan):+.1f}deg  vat_can: {obs_str}",
+            throttle_duration_sec=0.5,
+        )
+
         best, extra = self.planner_logic.plan_from_state(
             d_for_plan, c_d_d, self._latest_detections, ref_kappa=ref_kappa
         )
@@ -852,15 +984,56 @@ class ControlNode(Node):
             twist.angular.z = angular_z
             self.cmd_vel_pub.publish(twist)
 
+    def _tick_enter(self, loop: str) -> tuple[str, float, float | None] | None:
+        """Mở phép đo timing của 1 callback: lấy thời điểm vào + chu kỳ THẬT so
+        với lần gọi TRƯỚC của CÙNG timer. Trả token (loop, t_enter, prev) để
+        truyền cho _tick_exit() ở cuối callback — token là biến LOCAL nên 2
+        timer chạy song song (2 thread, callback group riêng) không giẫm nhau.
+        Trả None nếu timing tắt (callback bỏ qua đo)."""
+        if self._timing_writer is None:
+            return None
+        t_enter = time.monotonic()
+        prev = self._timing_last.get(loop)  # đọc/ghi key riêng theo loop, không đua chéo
+        self._timing_last[loop] = t_enter
+        return loop, t_enter, prev
+
+    def _tick_exit(self, token: tuple[str, float, float | None] | None) -> None:
+        """Đóng phép đo: tính exec_ms + period_ms, đẩy vào buffer (list.append
+        atomic dưới GIL), flush theo batch dưới _timing_lock để 2 thread không
+        double-flush."""
+        if token is None:
+            return
+        loop, t_enter, prev = token
+        t_exit = time.monotonic()
+        with self._timing_lock:
+            if self._timing_t0 is None:
+                self._timing_t0 = t_enter
+            period_ms = "" if prev is None else f"{(t_enter - prev) * 1000:.3f}"
+            exec_ms = f"{(t_exit - t_enter) * 1000:.3f}"
+            self._timing_buf.append(
+                (f"{t_enter - self._timing_t0:.4f}", loop, period_ms, exec_ms)
+            )
+            if len(self._timing_buf) >= self.log_timing_flush_n:
+                self._timing_writer.writerows(self._timing_buf)
+                self._timing_buf.clear()
+                self._timing_file.flush()
+
     def _control_tick(self) -> None:
         """EKF fusion (predict mỗi tick từ /odom) + publish mode/manual — auto
         cmd_vel publish từ _planner_tick (xem ở trên), không lặp lại ở đây."""
+        _tt = self._tick_enter("control")
         now = self.get_clock().now()
         if self._latest_odom is not None:
             dt = (now - self._last_predict_time).nanoseconds * 1e-9
             self._last_predict_time = now
             with self._ekf_lock:
                 self.ekf.predict(
+                    self._latest_odom.twist.twist.linear.x,
+                    self._latest_odom.twist.twist.angular.z,
+                    dt,
+                )
+                # encoder-only EKF: cùng predict, KHÔNG correct (xem __init__).
+                self._enc_ekf.predict(
                     self._latest_odom.twist.twist.linear.x,
                     self._latest_odom.twist.twist.angular.z,
                     dt,
@@ -873,10 +1046,72 @@ class ControlNode(Node):
             Float64MultiArray(data=[ekf_state.s, ekf_state.d, ekf_state.psi, ekf_state.v])
         )
 
+        self._maybe_log_compare()
+
         if self.mode is Mode.MANUAL:
             twist = Twist()
             twist.linear.x, twist.angular.z = self._manual_cmd
             self.cmd_vel_pub.publish(twist)
+
+        self._tick_exit(_tt)
+
+    def _maybe_log_compare(self) -> None:
+        """Ghi 1 dòng CSV so sánh (d, heading) 3 nguồn — chỉ khi bật log VÀ
+        đang ở đoạn THẲNG (không curve mode), throttle theo log_compare_rate_hz.
+        Mọi cột (d, heading) cùng quy ước VISION: d = d_meters (+d = line/lệch
+        sang phải theo perception), heading = độ. EKF/encoder lưu d dạng path
+        (= -d_meters) nên đổi dấu về vision (-state.d) khi ghi."""
+        if self._log_writer is None or self._curve_mode_active():
+            return
+        now = time.monotonic()
+        if (now - self._log_last_write) < (1.0 / self.log_compare_rate_hz):
+            return
+        self._log_last_write = now
+        if self._log_t0 is None:
+            self._log_t0 = now
+
+        with self._ekf_lock:
+            st = self.ekf.state
+            en = self._enc_ekf.state
+        ekf_d = -st.d
+        ekf_hdg = math.degrees(st.psi)
+        enc_d = -en.d
+        enc_hdg = math.degrees(en.psi)
+
+        vis = self._latest_vision
+        if vis is not None and (now - vis[2]) <= self.gps_vision_stale_s:
+            vision_d, vision_hdg, vision_fresh = vis[0], vis[1], 1
+        elif vis is not None:
+            vision_d, vision_hdg, vision_fresh = vis[0], vis[1], 0  # giá trị cũ, cờ 0
+        else:
+            vision_d = vision_hdg = float("nan")
+            vision_fresh = 0
+
+        self._log_writer.writerow([
+            f"{now - self._log_t0:.3f}", self.mode.value, vision_fresh,
+            f"{ekf_d:.4f}", f"{ekf_hdg:.3f}",
+            f"{vision_d:.4f}", f"{vision_hdg:.3f}",
+            f"{enc_d:.4f}", f"{enc_hdg:.3f}",
+        ])
+        self._log_file.flush()
+
+    def destroy_node(self) -> bool:
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
+        # Flush nốt buffer timing còn dở rồi đóng file.
+        if self._timing_writer is not None:
+            try:
+                with self._timing_lock:
+                    if self._timing_buf:
+                        self._timing_writer.writerows(self._timing_buf)
+                        self._timing_buf.clear()
+                self._timing_file.close()
+            except OSError:
+                pass
+        return super().destroy_node()
 
 
 def main(args: list[str] | None = None) -> None:

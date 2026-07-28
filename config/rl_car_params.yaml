@@ -48,14 +48,19 @@
     # curve_zone_*: dùng chung cho gps_node (gate curvature feed-forward) và
     # visualization_node (tô màu đoạn cua trên panel GPS) — PHẢI cùng giá trị
     # để hình vẽ khớp đúng đoạn feed-forward thật sự kích hoạt.
-    curve_zone_curvature_thresh: 0.05      # |kappa| CSV vượt mức này mới tính là "trong cua" [1/m] (~R<20m)
-    curve_zone_dilate_m: 5.0              # nới rộng mỗi curve zone thêm 2 đầu [m]
+    curve_zone_curvature_thresh: 0.1      # |kappa| CSV vượt mức này mới tính là "trong cua" [1/m] (~R<20m)
+    # LIST [zone0, zone1, ...] theo thứ tự cua dọc tuyến (s tăng dần) — chỉnh
+    # nới đầu/sau RIÊNG cho từng khúc cua. Vd tuyến có 2 cua: [10.0, 5.0] =
+    # cua đầu (s nhỏ) nới trước 10m, cua sau nới trước 5m. List NGẮN hơn số
+    # zone -> zone dư dùng phần tử CUỐI; 1 phần tử [x] = áp chung mọi cua.
+    curve_zone_dilate_before_m: [10.0, 5.0]  # nới ĐẦU cua (phía s NHỎ hơn, trigger zone SỚM hơn) [m] mỗi cua
+    curve_zone_dilate_after_m: [3.0, 5.0]    # nới SAU cua (phía s LỚN hơn, giữ zone thêm sau cua) [m] mỗi cua
 
 encoder_node:
   ros__parameters:
     serial_port: /dev/ttyUSB0          # cổng serial hoverboard
     baud_rate: 115200                   # baudrate serial hoverboard
-    wheel_radius: 0.07               # bán kính bánh xe [m]
+    wheel_radius: 0.075               # bán kính bánh xe [m]
     track_width: 0.3556                  # khoảng cách vệt bánh trái/phải [m]
     right_wheel_sign: -1.0               # đảo dấu chiều quay bánh phải (nếu encoder lắp ngược)
     poll_rate_hz: 150.0                  # tần số đọc feedback từ serial hoverboard [Hz]
@@ -66,8 +71,8 @@ encoder_node:
     publish_tf: true                     # có publish TF odom -> base_link hay không
     cmd_speed_scale: 50.0                # hệ số quy đổi /cmd_vel linear.x [m/s] -> speed_raw
     cmd_steer_scale: 26.7                # hệ số quy đổi /cmd_vel angular.z [rad/s] -> steer_raw
-    max_speed_raw: 50                    # giới hạn speed_raw gửi xuống hoverboard
-    max_steer_raw: 40                    # giới hạn steer_raw gửi xuống hoverboard
+    max_speed_raw: 100                    # giới hạn speed_raw gửi xuống hoverboard
+    max_steer_raw: 50                    # giới hạn steer_raw gửi xuống hoverboard
 
 joy_pygame_node:
   ros__parameters:
@@ -110,7 +115,7 @@ control_node:
     # control/node.py _planner_tick cho logic chuyển nguồn. GPS không bao
     # giờ đụng vào lệch ngang khi camera vẫn thấy line. ---
     gps_assist_enable: True             # bật fallback GPS lúc mất line dài
-    gps_vision_stale_s: 1.0              # camera không correct quá lâu (s) mới coi là mất line
+    gps_vision_stale_s: 999.0              # camera không correct quá lâu (s) mới coi là mất line
     gps_max_sigma_d: 0.6                 # sigma_d GPS phải dưới ngưỡng này mới được tin dùng [m]
     gps_ff_gain: 1.0                     # hệ số nhân kappa_ff (phần tử [4] của /gps/route_state,
                                           # 0 ngoài curve zone) vào curvature trước clamp; 0.0 = tắt
@@ -135,7 +140,7 @@ control_node:
                                           # sửa) — đo bằng mô phỏng vòng kín offline, 1.5 hết dao động vọt
                                           # qua 180°/phân kỳ; còn dư trôi nhỏ ở khúc cua gấp nhất thì tăng
                                           # thêm hoặc giảm auto_speed qua đoạn đó
-    route_csv: ""                        # rỗng = map/gps_path_2m.csv (dựng ReferenceCourse, cùng file gps_node)
+    route_csv: ""                        # rỗng = map/gps_log.csv (dựng ReferenceCourse, cùng file gps_node)
     curve_course_ds_m: 0.5               # bước sample spline course [m]
     gps_route_stale_s: 0.5               # /gps/route_state cũ hơn mức này [s] -> không vào/rời curve mode
     # --- Test bench curve mode: KHÔNG cần GPS/RouteEKF thật của gps_node, chỉ
@@ -152,10 +157,24 @@ control_node:
     # ĐÚNG 1 LƯỢT qua zone rồi tự bàn giao lại auto bình thường (thẳng/vision)
     # như bàn giao thật, không lặp phá driving liên tục. Test lại thì restart
     # control_node để rearm (xem control/node.py:_advance_test_state).
-    curve_frenet_force_test: true       # true = bench test, KHÔNG dùng khi lái thật
+    curve_frenet_force_test: true        # true = bench test, KHÔNG dùng khi lái thật
     curve_frenet_test_loop: false         # false = 1 lượt rồi bàn giao lại auto bình thường
-    curve_frenet_test_d_m: 0.0            # [m] d khởi tạo tại đầu zone (panel convention +=phải)
+    curve_frenet_test_d_m: 0.1            # [m] d khởi tạo tại đầu zone (panel convention +=phải)
     curve_frenet_test_psi_err_deg: 0.0    # [deg] psi_err khởi tạo tại đầu zone (+=phải)
+    # --- Log so sánh (d, heading) 3 nguồn ra CSV (chỉ đoạn thẳng) để vẽ đồ
+    # thị offline bằng scripts/plot_dheading_compare.py: EKF fused / vision
+    # thuần / encoder thuần (dead-reckon). Bật -> ghi mỗi log_compare_rate_hz. ---
+    log_compare_enable: true            # true = ghi CSV so sánh (chỉ bật khi cần đo, tắt lúc chạy thường)
+    log_compare_csv: ""                  # rỗng = tự đặt ~/rl_car_dheading_<timestamp>.csv (in path ra log)
+    log_compare_rate_hz: 20.0            # tần số ghi dòng CSV [Hz] (throttle từ 50Hz control tick)
+    # --- Log TIMING vòng điều khiển (đo loop-rate/jitter THẬT, KHÁC log_compare):
+    # ghi MỖI tick (không throttle) period thật + exec time của cả 2 timer
+    # (_control_tick 50Hz, _planner_tick 15Hz). Thống kê/vẽ bằng
+    # scripts/plot_loop_timing.py. Bật khi cần bảng timing cho paper, tắt lúc
+    # chạy thường (ghi ~65 dòng/s, nhẹ nhưng thừa). ---
+    log_timing_enable: true             # true = ghi CSV timing vòng điều khiển
+    log_timing_csv: ""                   # rỗng = tự đặt ~/rl_car_timing_<timestamp>.csv (in path ra log)
+    log_timing_flush_n: 200              # buffer N dòng trong RAM rồi flush đĩa (I/O không nhiễu phép đo)
 
 planner_motion_node:
   ros__parameters:
@@ -199,6 +218,12 @@ perception_node:
     seg_viz_all_classes: true            # seg cả 2 class (curb + line): class phụ CHỈ hiển thị (blend ảnh +
                                           # chấm xanh dương trên panel Frenet 2D), fit d/heading + seg_ratio
                                           # của detection vẫn chỉ dùng seg_target_class_id; false = như cũ
+    # --- Log TIMING perception (đo Hz frame + inference seg/det + frame age).
+    # Ghi ~/rl_car_perc_timing_<stamp>.csv, vẽ chung với timing control_node
+    # bằng scripts/plot_loop_timing.py. Tắt lúc chạy thường. ---
+    log_timing_enable: true              # true = ghi CSV timing perception
+    log_timing_csv: ""                    # rỗng = tự đặt ~/rl_car_perc_timing_<timestamp>.csv
+    log_timing_flush_n: 100               # buffer N frame rồi flush đĩa
 
 visualization_node:
   ros__parameters:
@@ -220,7 +245,7 @@ visualization_node:
     planner_viz_topic: /control/planner_viz            # topic path planner nội bộ của control_node để vẽ debug
     encoder_trail_max_points: 1500                     # số điểm tối đa giữ lại khi vẽ vệt đường đi encoder
     gps_route_state_topic: /gps/route_state            # topic [s_m, d_m, psi_err, sigma_d, kappa_ff] từ Gps/node.py
-    route_csv: ""                                      # rỗng = map/gps_path_2m.csv mặc định (để vẽ panel GPS)
+    route_csv: ""                                      # rỗng = map/gps_log.csv mặc định (để vẽ panel GPS)
     curve_panel_zoom_zone: true                         # panel Frenet lúc curve mode: true = khung nhìn ĐÚNG đoạn cua
                                                         # đang chạy (waypoint đầu -> cuối của zone, không phải toàn
                                                         # tuyến 551m); false = vẽ toàn tuyến CSV
@@ -232,28 +257,48 @@ gps_node:
     serial_port: /dev/ttyUSB1            # cổng serial module GPS (khác encoder_node's /dev/ttyUSB0)
     baud_rate: 230400                    # baudrate UBX
     serial_timeout: 1.0                  # timeout đọc serial [s]
-    route_csv: ""                        # rỗng = dùng map/gps_path_2m.csv mặc định
+    route_csv: ""                        # rỗng = dùng map/gps_log.csv mặc định
     predict_rate_hz: 50.0                # tần số predict RouteEKF từ /odom [Hz], khớp odom_publish_rate_hz
-    vision_timeout_s: 0.3                # camera im lặng quá mức này -> ngừng anchor_lateral(), để RouteEKF tự dead-reckon
+    vision_timeout_s: 0.3                # camera im lặng quá mức này -> coi vision KHÔNG TƯƠI, không đủ tin
+                                          # để neo điều kiện đầu lúc vào cua (xem anchor_on_curve_entry_only)
     odom_topic: /odom
     ekf_state_topic: /control/ekf_state          # [s,d,psi,v] của FrenetEKF (control_node) dùng để anchor
     frenet_state_topic: /perception/frenet_state # chỉ dùng để biết vision con "tuoi" hay khong
     route_state_topic: /gps/route_state          # publish [s_m, d_m, psi_err, sigma_d, kappa_ff] cho control_node
     # --- RouteEKF (đã tune bằng Gps/sim_route_ekf.py, xem route_ekf.py) ---
-    q_xy: 0.01                           # process noise vị trí [m^2/s] (trôi encoder)
+    q_xy: 0.005                           # process noise vị trí [m^2/s] (trôi encoder)
     q_psi: 0.0002                        # process noise heading [rad^2/s]
     min_fix_type: 3                      # chỉ nhận GPS fix 3D trở lên
-    max_h_acc_m: 30.0                     # hAcc receiver phải dưới ngưỡng này mới nhận fix
-    default_h_acc_m: 3.0                 # hAcc mặc định nếu receiver không báo
-    gps_gate_chi2: 100.0      # gate Mahalanobis 2 bậc tự do (99%) chặn multipath
+    max_h_acc_m: 15.0                     # hAcc receiver phải dưới ngưỡng này mới nhận fix
+    default_h_acc_m: 2.0                 # hAcc mặc định nếu receiver không báo
+    gps_gate_chi2: 15.0      # gate Mahalanobis 2 bậc tự do (99%) chặn multipath
     anchor_sigma_d: 0.15                 # độ tin d/psi từ vision lúc anchor_lateral() [m]
+    anchor_on_curve_entry_only: true     # true (khuyến nghị): VISION KHÔNG ĐỤNG vào RouteEKF khi chạy
+                                          # bình thường — tầng 2 là GPS+encoder thuần. Vision chỉ dùng
+                                          # ĐÚNG 1 LẦN tại cạnh lên curve zone làm ĐIỀU KIỆN ĐẦU cho
+                                          # đoạn cua (anchor_lateral chốt d/psi rồi thôi).
+                                          # false = hành vi cũ: anchor mỗi tick 50Hz khi ngoài zone —
+                                          # anchor_lateral() là GÁN ĐÈ state + reset P (không Kalman,
+                                          # không gate), nên 1 mẫu seg nhảy làn dịch pose tức thời
+                                          # (đo được 2.95m/mẫu khi encoder chỉ đi 0.088m) và sigma_d
+                                          # bị ép xuống giả tạo. Chỉ để so sánh hồi quy.
     project_window_m: 40.0               # cửa sổ tìm kiếm quanh s hiện tại khi chiếu lên tuyến [m]
     curve_zone_hysteresis_m: 4.0         # trong curve zone, correct_gps() CHẶN HẲN GPS (chỉ tin encoder
                                           # dead-reckon); margin này chống zone "nhấp nháy" khi s dao động
                                           # sát biên — đã vào zone thì phải đi xa hơn biên gốc thêm mức này
                                           # mới coi là ra (xem RouteEKF._update_curve_zone_state)
+    curve_zone_block_gps: true           # true = CHẶN GPS correct_gps() trong curve zone (mặc định, an toàn).
+                                          # false = VẪN CHO PHÉP GPS correct trong curve zone (GPS vẫn phải qua
+                                          # gate min_fix_type, max_h_acc_m, Mahalanobis bình thường)
     # --- Curvature feed-forward (curve_zone_* dùng chung, xem khối /** đầu file) ---
     curve_ff_preview_m: 1.5              # nhìn trước s+preview để lấy kappa_ff [m], khớp lookahead_distance
     # --- Curvature profile (phần tử [6:] của /gps/route_state, xem Gps/node.py:_curve_kappa_profile) ---
     kappa_profile_len_m: 12.0            # chiều dài profile curvature nhìn trước [m]
     kappa_profile_step_m: 0.5            # bước lấy mẫu dọc profile curvature [m]
+    # --- Ghi CSV quỹ đạo localization (lat/lon) TRỰC TIẾP từ gps_node — khỏi
+    # cần chạy script log riêng ở terminal 2. Bật true rồi lái qua cua, file
+    # tự lưu. Cột: t_s, lat, lon, in_curve_zone, s_m, d_m, sigma_d (cột
+    # in_curve_zone=0/1 để cắt đúng đoạn cua khi so với ground truth RTK). ---
+    log_latlon_enable: true            # true = ghi CSV quỹ đạo (chỉ bật khi cần đo, tắt lúc chạy thường)
+    log_latlon_csv: ""                   # rỗng = tự đặt ~/rl_car_run_<timestamp>.csv (in path ra log)
+    log_latlon_rate_hz: 10.0             # tần số ghi dòng CSV [Hz] (throttle từ 50Hz _tick)

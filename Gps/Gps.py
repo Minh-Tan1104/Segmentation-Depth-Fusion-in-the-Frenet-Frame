@@ -33,7 +33,7 @@ WGS84 = "EPSG:4326"
 WEB_MERCATOR = "EPSG:3857"
 
 # Tuyến ghi sẵn mặc định (map/gps_path_2m.csv cạnh thư mục Gps/).
-DEFAULT_ROUTE_CSV = Path(__file__).resolve().parent.parent / "map" / "gps_path_2m.csv"
+DEFAULT_ROUTE_CSV = Path(__file__).resolve().parent.parent / "map" / "gps_log.csv"
 
 
 def parse_args() -> argparse.Namespace:
