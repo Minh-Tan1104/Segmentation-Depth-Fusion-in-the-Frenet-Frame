@@ -705,10 +705,10 @@ class OverlayRenderer:
             cv2.circle(canvas, pts[-1], 7, (120, 120, 255), 1)
 
         # Số liệu EKF — số đổi liên tục == predict()/correct() vẫn chạy.
-        if ekf_state is not None and len(ekf_state) >= 4:
-            s_v, d_v, psi_v, v_v = ekf_state[:4]
-            line1 = f"EKF s={s_v:.2f} d={d_v:.2f}m"
-            line2 = f"psi={np.degrees(psi_v):+.1f}deg v={v_v:.2f}m/s"
+        if ekf_state is not None and len(ekf_state) >= 2:
+            d_v, psi_v = ekf_state[:2]
+            line1 = f"EKF d={d_v:.2f}m"
+            line2 = f"psi={np.degrees(psi_v):+.1f}deg"
             color = (60, 60, 60)
         else:
             line1, line2 = "EKF: no data yet", ""

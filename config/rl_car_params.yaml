@@ -101,13 +101,10 @@ control_node:
     track_width: 0.3556                  # khoảng cách vệt bánh, dùng để tính omega -> cmd_vel
     max_wheel_speed: 1.2                 # giới hạn tốc độ từng bánh sau khi tính differential [m/s]
     # --- EKF fusion odom + quan sát làn từ perception (xem control/ekf.py) ---
-    ekf_q_s: 0.02                        # process noise của s (quãng đường dọc)
     ekf_q_d: 0.01                         # process noise của d (lệch ngang khỏi tâm làn)
     ekf_q_psi: 0.01                       # process noise của psi (heading)
-    ekf_q_v: 0.05                         # process noise của v (vận tốc)
     ekf_r_d: 0.04                         # measurement noise của d đo từ perception
     ekf_r_psi: 0.0076154                 # measurement noise của psi đo từ perception (= radians(5°)^2)
-    ekf_r_v: 0.02                        # measurement noise của v đo từ odom
     planner_rate_hz: 15.0                # tần số planner nội bộ của control_node (_planner_tick) [Hz]
     # --- Frenet Optimal Planner nội bộ: các plan_* khai báo dùng chung ở khối /** đầu file ---
     # --- GPS assist (Gps/route_ekf.py) — CHỈ dùng d/psi_err từ GPS khi mất
@@ -115,7 +112,9 @@ control_node:
     # control/node.py _planner_tick cho logic chuyển nguồn. GPS không bao
     # giờ đụng vào lệch ngang khi camera vẫn thấy line. ---
     gps_assist_enable: True             # bật fallback GPS lúc mất line dài
-    gps_vision_stale_s: 999.0              # camera không correct quá lâu (s) mới coi là mất line
+    gps_vision_stale_s: 0.3               # camera không correct quá lâu (s) mới coi là mất line — khớp
+                                          # vision_timeout_s bên Gps/node.py (anchor read); giờ CŨNG gate
+                                          # entry của curve mode (_curve_mode_active), xem control/node.py
     gps_max_sigma_d: 0.6                 # sigma_d GPS phải dưới ngưỡng này mới được tin dùng [m]
     gps_ff_gain: 1.0                     # hệ số nhân kappa_ff (phần tử [4] của /gps/route_state,
                                           # 0 ngoài curve zone) vào curvature trước clamp; 0.0 = tắt

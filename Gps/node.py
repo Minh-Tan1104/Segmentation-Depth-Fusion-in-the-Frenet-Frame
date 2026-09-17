@@ -193,7 +193,7 @@ class GpsNode(Node):
         self._latest_odom: Odometry | None = None
         self._last_predict_time = self.get_clock().now()
         self._last_vision_fresh_time: float | None = None
-        self._latest_camera_ekf_state: tuple[float, float, float, float] | None = None
+        self._latest_camera_ekf_state: tuple[float, float] | None = None
         # Trạng thái curve-zone tick TRƯỚC — để phát hiện CẠNH LÊN (ngoài ->
         # trong zone), thời điểm DUY NHẤT vision được phép chạm vào state.
         self._prev_in_curve_zone = False
@@ -304,8 +304,8 @@ class GpsNode(Node):
         self._latest_odom = msg
 
     def _camera_ekf_state_cb(self, msg: Float64MultiArray) -> None:
-        if len(msg.data) >= 4:
-            self._latest_camera_ekf_state = tuple(msg.data[:4])
+        if len(msg.data) >= 2:
+            self._latest_camera_ekf_state = tuple(msg.data[:2])
 
     def _frenet_state_cb(self, msg: String) -> None:
         try:
@@ -445,7 +445,7 @@ class GpsNode(Node):
                 and vision_fresh
                 and self._latest_camera_ekf_state is not None
             ):
-                _s, d_cam, psi_cam, _v = self._latest_camera_ekf_state
+                d_cam, psi_cam = self._latest_camera_ekf_state
                 self.route_ekf.anchor_lateral(d_m=d_cam, psi_err=psi_cam)
                 # anchor_lateral() vừa ghi đè x/P -> đọc lại state cho khớp
                 # với cái sẽ publish/log ngay bên dưới.

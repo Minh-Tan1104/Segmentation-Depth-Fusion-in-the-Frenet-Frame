@@ -122,13 +122,10 @@ class ControlNode(Node):
         self.declare_parameter("pure_pursuit_heading_gain", 0.5)
         self.declare_parameter("track_width", 0.3556)
         self.declare_parameter("max_wheel_speed", 1.2)
-        self.declare_parameter("ekf_q_s", 0.02)
         self.declare_parameter("ekf_q_d", 0.01)
         self.declare_parameter("ekf_q_psi", 0.01)
-        self.declare_parameter("ekf_q_v", 0.05)
         self.declare_parameter("ekf_r_d", 0.04)
         self.declare_parameter("ekf_r_psi", math.radians(5.0) ** 2)
-        self.declare_parameter("ekf_r_v", 0.02)
         self.declare_parameter("planner_rate_hz", 15.0)
         self.declare_parameter("plan_enable", True)
         self.declare_parameter("plan_speed", 2.0)
@@ -245,13 +242,10 @@ class ControlNode(Node):
         )
 
         self.ekf = FrenetEKF(
-            q_s=float(self.get_parameter("ekf_q_s").value),
             q_d=float(self.get_parameter("ekf_q_d").value),
             q_psi=float(self.get_parameter("ekf_q_psi").value),
-            q_v=float(self.get_parameter("ekf_q_v").value),
             r_d=float(self.get_parameter("ekf_r_d").value),
             r_psi=float(self.get_parameter("ekf_r_psi").value),
-            r_v=float(self.get_parameter("ekf_r_v").value),
         )
         # EKF được đọc/ghi từ 2 timer khác nhau (_control_tick + _planner_tick,
         # 2 callback group riêng trên MultiThreadedExecutor) -> cần lock.
@@ -263,13 +257,10 @@ class ControlNode(Node):
         # Cùng tham số Q với ekf chính để so sánh công bằng. Dùng chung
         # _ekf_lock (chỉ đụng trong _control_tick predict + _frenet_state_cb seed).
         self._enc_ekf = FrenetEKF(
-            q_s=float(self.get_parameter("ekf_q_s").value),
             q_d=float(self.get_parameter("ekf_q_d").value),
             q_psi=float(self.get_parameter("ekf_q_psi").value),
-            q_v=float(self.get_parameter("ekf_q_v").value),
             r_d=float(self.get_parameter("ekf_r_d").value),
             r_psi=float(self.get_parameter("ekf_r_psi").value),
-            r_v=float(self.get_parameter("ekf_r_v").value),
         )
         self._enc_seeded = False
         self._latest_vision: tuple[float, float, float] | None = None  # (d_meters, heading_deg, mono_t)
@@ -655,7 +646,14 @@ class ControlNode(Node):
 
         VÀO (cạnh lên, self._curve_mode_prev=False): gate ĐẦY ĐỦ — phải đang
         TRONG curve zone (in_curve_zone, vị trí) VÀ sigma_d đủ tin cậy
-        (RouteEKF chưa dead-reckon mù quá lâu) mới cho vào.
+        (RouteEKF chưa dead-reckon mù quá lâu) VÀ vision ĐANG MẤT
+        (not _vision_fresh()) mới cho vào. Đối xứng với gate THOÁT bên dưới
+        (which requires in_curve_zone=False OR vision fresh trở lại) — cùng
+        logic "curve mode chỉ chạy khi thực sự không còn vision để dùng",
+        không phải chỉ dựa vị trí hình học suông. Nếu xe vào vùng cua nhưng
+        camera vẫn đang thấy line (vd cua rất thoáng, chưa mất line), pipeline
+        THẲNG (vision) tiếp tục lái — curve mode chỉ nhảy vào đúng lúc cả 2
+        điều kiện (vị trí + mất line) cùng xảy ra.
 
         ĐANG CHẠY (self._curve_mode_prev=True): thoát (trả False, bàn giao
         lại vision) CHỈ KHI CẢ 2 điều kiện cùng đúng — đã ra khỏi zone theo
@@ -691,7 +689,11 @@ class ControlNode(Node):
         _s, _d, _psi_err, sigma_d, _kappa_ff, in_curve_zone = self._latest_gps_route
         if self._curve_mode_prev:
             return bool(in_curve_zone) or not self._vision_fresh()
-        return sigma_d < self.gps_max_sigma_d and bool(in_curve_zone)
+        return (
+            sigma_d < self.gps_max_sigma_d
+            and bool(in_curve_zone)
+            and not self._vision_fresh()
+        )
 
     def _advance_test_state(self) -> tuple[float, float, float, float]:
         """Sinh (s, d, psi_err, sigma_d) cho test bench thay cho /gps/route_state
@@ -743,8 +745,7 @@ class ControlNode(Node):
           convert sang map-local, obstacle transform từ frame xe sang map,
           max_curvature check trên path thật.
         - Pure pursuit chạy trên (s, d) tuyệt đối + feed-forward độ cong
-          course tại đúng điểm lookahead. FrenetEKF hoàn toàn không tham gia
-          (chỉ reset_s_origin giữ nếp cho lúc quay lại mode thẳng).
+          course tại đúng điểm lookahead. FrenetEKF hoàn toàn không tham gia.
 
         curve_frenet_force_test=true: (s_route, d_route, psi_route, sigma_d)
         lấy từ _advance_test_state() (RouteEKF riêng, predict() bằng /odom
@@ -807,9 +808,6 @@ class ControlNode(Node):
             best.s, best.d, s_now, d_now, psi_now, self.auto_speed, self.curve_pp_cfg,
             ff_curvature=ff_curvature,
         )
-
-        with self._ekf_lock:
-            self.ekf.reset_s_origin()
 
         # Payload cho panel CSV-frame (visualization/logic.py:
         # draw_curve_map_panel) — mọi toạ độ là map-local của tuyến, panel vẽ
@@ -943,15 +941,12 @@ class ControlNode(Node):
         # có thể khác state.d khi dùng GPS), nếu không lateral_error sẽ lệch
         # giả tạo giữa 2 nguồn khác nhau. psi_for_plan luôn = state.psi (GPS
         # không ghi đè heading) nên không có vấn đề lệch nguồn ở psi.
-        # state.s (quãng đường dead-reckon từ lần replan trước) không có
-        # tương đương bên GPS nên vẫn giữ nguyên từ FrenetEKF ở cả 2 chế độ.
+        # s_now = 0.0: plan_from_state() luôn sinh path với s0=0.0 (vị trí xe
+        # NGAY LÚC plan chạy) nên xe luôn ở s=0 trên path vừa sinh.
         linear_x, angular_z, target_s, target_d = compute_cmd_vel(
-            best.s, best.d, state.s, d_for_plan, psi_for_plan, self.auto_speed, self.pp_cfg,
+            best.s, best.d, 0.0, d_for_plan, psi_for_plan, self.auto_speed, self.pp_cfg,
             ff_curvature=ff_curvature,
         )
-
-        with self._ekf_lock:
-            self.ekf.reset_s_origin()
 
         # Payload theo đúng format mà OverlayRenderer.draw_frenet_panel đang
         # đọc (visualization/logic.py) — d_meters_filtered đổi dấu lại về
@@ -1043,7 +1038,7 @@ class ControlNode(Node):
         with self._ekf_lock:
             ekf_state = self.ekf.state
         self.ekf_state_pub.publish(
-            Float64MultiArray(data=[ekf_state.s, ekf_state.d, ekf_state.psi, ekf_state.v])
+            Float64MultiArray(data=[ekf_state.d, ekf_state.psi])
         )
 
         self._maybe_log_compare()

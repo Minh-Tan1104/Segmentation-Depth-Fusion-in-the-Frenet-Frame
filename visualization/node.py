@@ -199,7 +199,7 @@ class VisualizationNode(Node):
         self._odom_trail.append((x, y))
 
     def _ekf_state_callback(self, msg: Float64MultiArray) -> None:
-        if len(msg.data) >= 4:
+        if len(msg.data) >= 2:
             self._latest_ekf_state = list(msg.data)
 
     def _gps_route_state_callback(self, msg: Float64MultiArray) -> None:

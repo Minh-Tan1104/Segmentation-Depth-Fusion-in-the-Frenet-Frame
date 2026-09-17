@@ -3,7 +3,7 @@
 <package format="3">
   <name>RL_CAR</name>
   <version>0.1.0</version>
-  <description>Perception (lane segmentation + Frenet + detection) -> planner (Frenet Optimal) -> visualization for a self-driving car.</description>
+  <description>Perception (seg làn + Frenet + detection) -> planner (Frenet Optimal) -> visualization cho xe tự hành.</description>
   <maintainer email="khoa16042003@gmail.com">minh_tan</maintainer>
   <license>MIT</license>
 

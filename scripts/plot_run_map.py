@@ -229,35 +229,36 @@ def main() -> None:
             print(f"Ground truth: trimmed head, drawing vertices {lo}..{hi} "
                   f"({hi - lo + 1}/{gx_full.size} points, starting at run START)")
         ax_map.plot(gx_plot, gy_plot, "--", color="#2ca02c", lw=2.0, zorder=3,
-                    label="Ground truth")
+                    label="Ground truth (RTK)")
 
-    # GPS thô: chấm mờ dưới cùng.
+    # GNSS thô: chấm mờ dưới cùng.
     raw_sel = np.isfinite(r_lat) & np.isfinite(r_lon)
     if args.curve_only:
         raw_sel &= curve_mask
     if raw_sel.any():
         rx, ry = to_xy(tf, r_lat[raw_sel], r_lon[raw_sel])
-        ax_map.scatter(rx, ry, c="#1f77b4", s=4, alpha=0.35, zorder=4, label="GPS (raw)")
+        ax_map.scatter(rx, ry, c="#1f77b4", s=4, alpha=0.35, zorder=4, label="GNSS raw")
 
-    # Encoder thuần dead-reckoning.
+    # Encoder thuần dead-reckoning (không anchor).
     enc_sel = np.isfinite(e_lat) & np.isfinite(e_lon)
     if args.curve_only:
         enc_sel &= curve_mask
     if enc_sel.any():
         qx, qy = to_xy(tf, e_lat[enc_sel], e_lon[enc_sel])
         ax_map.plot(qx, qy, "-", color="#ff7f0e", lw=1.3, alpha=0.85, zorder=5,
-                    label="Encoder (dead-reckoning)")
+                    label="Encoder DR, unanchored")
 
-    # RouteEKF: đường chính, ngoài cua đỏ mảnh, trong cua đỏ dày.
+    # RouteEKF: đường chính, ngoài cua đỏ mảnh (fused), trong cua đỏ dày
+    # (anchored dead-reckon — GPS/vision bị chặn, xem Gps/route_ekf.py).
     plot_sel = map_sel & curve_mask if args.curve_only else map_sel
     ax_map.plot(ex[plot_sel], ey[plot_sel], "-", color="#d62728", lw=1.6, zorder=6,
-                label="RouteEKF (fused)")
+                label="Route-frame (fused, outside zone)")
     if zone_ok.any():
         # Vẽ từng đoạn cua liền mạch để không nối ngang giữa các zone.
         first = True
         for i0, i1 in contiguous_segments(zone_ok):
             ax_map.plot(ex[i0:i1], ey[i0:i1], "-", color="#8b0000", lw=3.2, zorder=7,
-                        label="RouteEKF (in curve)" if first else None)
+                        label="Route-frame (anchored DR, in zone)" if first else None)
             first = False
 
     run_i = np.flatnonzero(map_sel)
@@ -319,7 +320,27 @@ def main() -> None:
     ax_map.set_ylabel("Y (m)")
     ax_map.grid(True, alpha=0.3)
     ax_map.set_title("Localization comparison")
-    ax_map.legend(loc="upper right", fontsize=8)
+    # Legend "upper right" hay đè lên chính quỹ đạo (vd điểm "end" nằm ở đỉnh
+    # trục Y như run này) — không phải lỗi icon, mà legend che dữ liệu thật.
+    # Dùng margins() (KHÔNG tự set_ylim bằng tay) để nới chỗ: set_aspect
+    # "equal, datalim" tính lại giới hạn trục LÚC VẼ dựa trên toàn bộ datalim
+    # (gồm cả patch Circle của curve zone) — set_ylim thủ công trước đó bị nó
+    # ghi đè và cắt cụt hình tròn vì không biết bán kính patch. margins() cộng
+    # lề vào chính datalim nên luôn bao trọn mọi artist, kể cả Circle.
+    ax_map.margins(y=0.38)
+    map_legend = ax_map.legend(loc="upper right", fontsize=8)
+    # scatter() truyền y nguyên 'x' (kích thước điểm THẬT trên map) vào legend
+    # -> "GNSS raw" (s=4, gần như vô hình) và "end" (s=90) lệch quá xa nhau,
+    # icon to đè lên/che dòng chữ kế bên. Ép mọi marker trong legend về 1 cỡ
+    # thống nhất — không đụng tới kích thước điểm thật trên bản đồ.
+    # legend_handles (snake_case) chỉ có tu matplotlib>=3.7; ban cu (vd 3.5)
+    # chi co legendHandles (camelCase, da deprecated o ban moi) -> fallback.
+    legend_handles = getattr(map_legend, "legend_handles", None)
+    if legend_handles is None:
+        legend_handles = map_legend.legendHandles
+    for handle in legend_handles:
+        if hasattr(handle, "set_sizes"):
+            handle.set_sizes([36])
 
     # --- Panel phải: lệch ngang CÓ DẤU so với GT, CHỈ trong đoạn cua ---
     # Quy ước dấu: + = xe lệch sang TRÁI của ground truth, − = lệch sang PHẢI.
@@ -332,25 +353,23 @@ def main() -> None:
             for i0, i1 in contiguous_segments(curve_mask):
                 ax_ds.axvspan(np.nanmin(s_m[i0:i1]), np.nanmax(s_m[i0:i1]),
                               color="#17becf", alpha=0.12, zorder=0,
-                              label="curve zone" if cz_label else None)
+                              label="Curve zone" if cz_label else None)
                 cz_label = False
             # Chỉ giữ mẫu trong cua; NaN ngoài cua để đường ngắt đúng ranh giới.
             s_cv = np.where(curve_mask, s_m, np.nan)
             order = np.argsort(np.where(np.isfinite(s_cv), s_cv, np.inf))
-            for name, color, ls in (("RouteEKF", "#d62728", "-"),
-                                    ("GPS raw", "#1f77b4", ":"),
-                                    ("Encoder", "#ff7f0e", "--")):
+            for name, color, ls, lbl in (("RouteEKF", "#d62728", "-", "Route-frame, anchored DR"),
+                                         ("GPS raw", "#1f77b4", ":", "GNSS raw"),
+                                         ("Encoder", "#ff7f0e", "--", "Encoder DR, unanchored")):
                 sig = signed_by_name.get(name)
                 if sig is None:
                     continue
                 y = np.where(curve_mask, sig, np.nan)
-                lbl = {"GPS raw": "GPS (raw)"}.get(name, name)
-                ax_ds.plot(s_cv[order], y[order], color=color, ls=ls, lw=1.7,
-                           label=f"{lbl} with Ground truth")
+                ax_ds.plot(s_cv[order], y[order], color=color, ls=ls, lw=1.7, label=lbl)
             ax_ds.axhline(0.0, color="0.5", lw=1.0)
             ax_ds.set_xlabel("s (m)")
-            ax_ds.set_ylabel("lateral error (m)")
-            ax_ds.set_title("Lateral error with Ground truth (in curve)")
+            ax_ds.set_ylabel("lateral deviation (m)")
+            ax_ds.set_title("Lateral deviation from ground truth (RTK), in curve")
             # Giới hạn trục x quanh vùng cua cho dễ đọc (+ biên 5 m).
             s_in = s_m[curve_mask & np.isfinite(s_m)]
             if s_in.size:
