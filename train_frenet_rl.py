@@ -68,6 +68,8 @@ from planner_motion.frenet_planner import (
 )
 from planner_motion.rl_policy import (
     RLPolicyMeta,
+    SideLatch,
+    canonical_observation,
     build_observation,
     decode_action,
     meta_path,
@@ -127,7 +129,18 @@ RL_META = RLPolicyMeta(
     min_t=PLANNER_CFG.min_t,
     max_t=PLANNER_CFG.max_t,
     vision_range_m=VISION_RANGE_M,
+    # has_obstacle trong obs: không có nó, "đường trống" trùng observation
+    # với "obstacle giữa làn vừa vào tầm nhìn" -> oversample obstacle giữa
+    # làn làm policy lệch sẵn 1 bên cả khi đường trống (đo: -0.37m).
+    obs_version=2,
+    # Khung gương (SideLatch, xem rl_policy.py): policy luôn thấy vật cản ở
+    # trái-hoặc-thẳng xe. Không có nó, policy liên tục buộc phải có 1 dải
+    # d_target≈0 quanh d_obs≈d_xe (chuyển giữa né phải/né trái) — đo: model
+    # thường va 18/87 ca vật cản sát giữa; chỉ thêm khung gương lúc chạy
+    # (không train lại) đã còn 0/87.
+    canonical=True,
 )
+assert RL_META.center_offset == 0.0, "khung gương lật action quanh tâm làn"
 
 MODELS_DIR = "models"
 PLOTS_DIR = "plots"
@@ -186,7 +199,16 @@ ENV_CONFIG = {
     # đều cho thấy agent học rush ra d_max thay vì né đúng cách. Nâng lên
     # 200 để hoàn thành course rõ ràng là lựa chọn tốt nhất, áp đảo mọi
     # chiến lược "thoát sớm".
-    "r_goal": 200.0,
+    "r_goal": 200.0,   # KHÔNG còn dùng — thay bằng r_alive, xem dưới
+    # r_alive: thưởng đều mỗi step thay cho r_goal. r_goal=+200 ở CUỐI đường
+    # làm giá trị trạng thái phụ thuộc quãng đã đi (obs không có) — đo: return
+    # còn lại -7.6 lúc đầu đường -> +164 gần đích, trong khi |d| cũng tăng
+    # theo quãng đường (mọi episode xuất phát gần tâm) -> critic gán giá trị
+    # cao cho "lệch" (policy trôi ~0.7m dù giữ tâm cho return thật cao hơn).
+    # r_alive=2 > cost/step lúc lái tốt (~0.7-1.3) nên reward/step dương:
+    # "thoát sớm" bằng off-lane/va chạm luôn mất phần thưởng tương lai — đúng
+    # vai trò r_goal từng giữ, nhưng không phụ thuộc vị trí trên đường.
+    "r_alive": 2.0,
     # Tỉ lệ episode có obstacle đặt SÁT GIỮA làn (|d_obs| <= band). Đo thật:
     # policy chọn phía né theo DẤU của d_obs, nên tại d_obs≈0 (không có dấu)
     # nó đi thẳng vào obstacle — va chạm 70-85% tại đúng d_obs=0, còn lệch
@@ -195,6 +217,21 @@ ENV_CONFIG = {
     # né thành công và policy học theo.
     "center_obstacle_prob": 0.2,
     "center_obstacle_band_m": 0.1,
+    # Điều kiện đầu random mỗi episode (|d0|, |psi0|). Rộng hơn ±0.3m/±5° để
+    # policy học cả cách HỘI TỤ về tâm từ vị trí lệch/heading lệch (vd sau
+    # khi né xong, hoặc kịch bản heading_offset ±20° trong test).
+    # Chuỗi vật cản mỗi episode: vị trí đầu ~U(first_obstacle_s_m), rồi cứ
+    # cách U(obstacle_gap_m) lại có 1 vật với xác suất obstacle_prob. Gap tối
+    # thiểu > vision_range_m (8m) -> thường chỉ thấy 1 vật mỗi lúc (obs chỉ
+    # mô tả vật gần nhất), nhưng vẫn đủ gần để vật sau không "chắc chắn trống".
+    "first_obstacle_s_m": (10.0, 25.0),
+    "obstacle_gap_m": (12.0, 25.0),
+    "obstacle_prob": 0.7,
+    "init_d_range_m": 0.3,
+    "init_psi_range_deg": 5.0,
+    # False: env nhận action ở khung THẬT (dùng khi đánh giá qua RLPolicy,
+    # vốn tự lật gương) thay vì khung gương của policy lúc train.
+    "canonical": RL_META.canonical,
 }
 
 # use_sde: bật vì action là target liên tục cần khám phá "mượt theo thời
@@ -258,9 +295,14 @@ class FrenetStraightEnv(gym.Env):
 
         self.ekf = FrenetEKF()
         self.s_ego = 0.0
+        # Tất cả vật cản của episode (s tuyệt đối, d); self.obstacle = vật cản
+        # gần nhất chưa vượt qua (cho viz/info, tương thích code cũ).
+        self._obstacles: list[tuple[float, float]] = []
         self.obstacle: tuple[float, float] | None = None
         self.step_count = 0
         self._rng = np.random.default_rng()
+        self._latch = SideLatch(RL_META.side_switch_m)
+        self._side = 1
 
     # ── Gymnasium API ───────────────────────────────────────────────────
     def reset(self, *, seed: int | None = None, options: dict | None = None):
@@ -272,34 +314,51 @@ class FrenetStraightEnv(gym.Env):
         d0 = options.get("d0")
         psi0 = options.get("psi0")
         if d0 is None:
-            d0 = float(self._rng.uniform(-0.3, 0.3))
+            r = self.cfg["init_d_range_m"]
+            d0 = float(self._rng.uniform(-r, r))
         if psi0 is None:
-            psi0 = float(self._rng.uniform(math.radians(-5.0), math.radians(5.0)))
+            r = math.radians(self.cfg["init_psi_range_deg"])
+            psi0 = float(self._rng.uniform(-r, r))
         self.ekf = FrenetEKF()
         self.ekf.x = np.array([d0, psi0])
 
-        if "obstacle" in options:
-            self.obstacle = options["obstacle"]
+        if "obstacles" in options:
+            self._obstacles = sorted(options["obstacles"])
+        elif "obstacle" in options:
+            self._obstacles = [options["obstacle"]] if options["obstacle"] is not None else []
         else:
-            has_obstacle = self._rng.uniform() > 0.3
-            if has_obstacle:
-                s_obs = float(self._rng.uniform(10.0, self.cfg["course_length_m"] - 5.0))
-                if self._rng.uniform() < self.cfg["center_obstacle_prob"]:
-                    band = self.cfg["center_obstacle_band_m"]
-                    d_obs = float(self._rng.uniform(-band, band))
-                else:
-                    d_obs = float(self._rng.uniform(D_MIN_OFFSET * 0.75, D_MAX_OFFSET * 0.75))
-                self.obstacle = (s_obs, d_obs)
-            else:
-                self.obstacle = None
+            # CHUỖI vật cản rải suốt đường, không phải 1 vật/episode. Với 1
+            # vật, "xe lệch + đường trống" trong dữ liệu gần như luôn = "vừa né
+            # xong, phía trước chắc chắn trống, sắp tới goal" -> critic học
+            # tương quan giả "lệch = an toàn" (đo: Q theo d hình chữ V, đáy ở
+            # tâm -5.7, lệch 0.75m +17) và policy cố tình trôi ra ~0.75m, dù
+            # return thật khi giữ tâm cao hơn hẳn (90 vs 37). Chuỗi vật cản
+            # làm tương lai khi đường trống không phụ thuộc lịch sử né.
+            cfg = self.cfg
+            self._obstacles = []
+            s_obs = float(self._rng.uniform(*cfg["first_obstacle_s_m"]))
+            while s_obs < cfg["course_length_m"] - 5.0:
+                if self._rng.uniform() < cfg["obstacle_prob"]:
+                    if self._rng.uniform() < cfg["center_obstacle_prob"]:
+                        band = cfg["center_obstacle_band_m"]
+                        d_obs = float(self._rng.uniform(-band, band))
+                    else:
+                        d_obs = float(self._rng.uniform(D_MIN_OFFSET * 0.75, D_MAX_OFFSET * 0.75))
+                    self._obstacles.append((s_obs, d_obs))
+                s_obs += float(self._rng.uniform(*cfg["obstacle_gap_m"]))
 
         self.s_ego = 0.0
         self.step_count = 0
+        self._update_current_obstacle()
 
+        self._latch.reset()
         return self._obs(), {}
 
     def step(self, action: np.ndarray):
         action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+        if self.cfg["canonical"]:
+            action = action.copy()
+            action[0] *= self._side  # khung gương -> khung thật
         cfg = self.cfg
         d_target, Ti = self._decode_action(action)
 
@@ -310,10 +369,7 @@ class FrenetStraightEnv(gym.Env):
 
         fp = self._build_path(d_before, c_d_d, d_target, Ti, c_speed)
 
-        obstacles_relative = []
-        if self.obstacle is not None:
-            s_obs_abs, d_obs = self.obstacle
-            obstacles_relative.append((s_obs_abs - self.s_ego, d_obs))
+        obstacles_relative = [(s_o - self.s_ego, d_o) for s_o, d_o in self._obstacles]
 
         # Reuse NGUYÊN VẸN check hard-constraint (va chạm/tốc độ/gia
         # tốc/độ cong) của planner gốc — path không lọt qua đây coi như
@@ -347,6 +403,7 @@ class FrenetStraightEnv(gym.Env):
         delta_s = linear_x * math.cos(psi_before) * cfg["dt"]
         self.s_ego += delta_s
 
+        self._update_current_obstacle()
         d_after = float(self.ekf.state.d)
         psi_after = float(self.ekf.state.psi)
 
@@ -354,7 +411,7 @@ class FrenetStraightEnv(gym.Env):
             d_after, psi_after, feasible, cost, closest_dist
         )
         self.step_count += 1
-        truncated = self.step_count >= cfg["max_episode_steps"]
+        truncated = (self.step_count >= cfg["max_episode_steps"] or info["reached_goal"]) and not terminated
 
         # Dữ liệu path/pose CỦA TICK NÀY (trước khi update sang tick sau) —
         # không ảnh hưởng reward/kinematics, chỉ để VizCallback vẽ panel
@@ -421,6 +478,10 @@ class FrenetStraightEnv(gym.Env):
             best = min(best, d)
         return best
 
+    def _update_current_obstacle(self) -> None:
+        ahead = [o for o in self._obstacles if o[0] - self.s_ego >= 0.0]
+        self.obstacle = ahead[0] if ahead else None
+
     def _obstacle_obs(self) -> tuple[float, float, float]:
         """Trả (ds_obs quan sát được, d_obs quan sát được, ds thật hoặc inf).
         Giới hạn tầm nhìn CHỈ áp dụng cho observation (POMDP) — vật lý
@@ -437,9 +498,11 @@ class FrenetStraightEnv(gym.Env):
     def _obs(self) -> np.ndarray:
         ds_obs, d_obs, ds_real = self._obstacle_obs()
         obstacle = (ds_obs, d_obs) if math.isfinite(ds_real) else None
-        return build_observation(
-            float(self.ekf.state.d), float(self.ekf.state.psi), obstacle, RL_META
-        )
+        d, psi = float(self.ekf.state.d), float(self.ekf.state.psi)
+        if not self.cfg["canonical"]:
+            return build_observation(d, psi, obstacle, RL_META)
+        self._side = self._latch.update(d, obstacle)
+        return canonical_observation(d, psi, obstacle, self._side, RL_META)
 
     def _reward_and_done(self, d, psi, feasible, cost, closest_dist):
         """reward = -cost, với cost = fp.cf + k_obs*obstacle_cost(fp, obstacles)
@@ -453,7 +516,7 @@ class FrenetStraightEnv(gym.Env):
         cfg = self.cfg
         _ds_obs, _d_obs, ds_real = self._obstacle_obs()
 
-        reward = -cost
+        reward = -cost + cfg["r_alive"]
 
         terminated = False
         info: dict = {"collided": False, "off_lane": False, "reached_goal": False,
@@ -468,8 +531,8 @@ class FrenetStraightEnv(gym.Env):
             terminated = True
             info["off_lane"] = True
         elif self.s_ego >= cfg["course_length_m"]:
-            reward += cfg["r_goal"]
-            terminated = True
+            # Hết đường = CẮT (truncated, step() xử lý), không phải trạng thái
+            # kết thúc: xe vẫn chạy tiếp được, SAC bootstrap qua đó.
             info["reached_goal"] = True
 
         return reward, terminated, info

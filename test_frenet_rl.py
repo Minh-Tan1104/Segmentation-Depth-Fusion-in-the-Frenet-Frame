@@ -19,6 +19,13 @@ Khi so sánh: dùng FrenetStraightEnv(discretize_d_for_eval=True) để round
 d_target liên tục của SAC về lưới rời rạc (center_offset + k*d_road_w) mà
 cost-based planner đang dùng — so sánh công bằng (xem train_frenet_rl.py:
 _round_to_grid).
+
+SAC chạy qua ĐÚNG đường của robot: RLPolicy (planner_motion/rl_policy.py —
+đọc meta cạnh model, tự áp khung gương + chốt phía nếu model train theo
+kiểu đó) + gate "chỉ đưa vật cản cho policy khi đi thẳng không an toàn"
+(như PlannerLogic._plan_rl). Nên chạy được cả model mới lẫn model cũ.
+
+    python3 test_frenet_rl.py [đường_dẫn_model]   # mặc định MODEL_PATH
 """
 
 from __future__ import annotations
@@ -26,14 +33,14 @@ from __future__ import annotations
 import math
 import multiprocessing as mp
 import os
+import sys
 
 import numpy as np
-
-from stable_baselines3 import SAC
 
 from control.ekf import FrenetEKF
 from control.pure_pursuit import compute_cmd_vel
 from planner_motion.frenet_planner import FrenetOptimalPlanner
+from planner_motion.rl_policy import RLPolicy, decode_action
 
 from train_frenet_rl import (
     ENV_CONFIG,
@@ -50,7 +57,9 @@ from train_frenet_rl import (
     render_frenet_panel,
 )
 
-MODEL_PATH = os.path.join(MODELS_DIR, "sac_frenet_straight")
+MODEL_PATH = os.path.join(MODELS_DIR, "sac_frenet_straight_v2")
+# Gate như control_node (PlannerLogic._plan_rl): False = policy luôn thấy vật cản.
+USE_GATE = True
 
 # Kịch bản cố định: obstacle đặt giữa đoạn đường (d0/psi0=0), quét NGANG qua
 # 7 vị trí d_obs cách nhau 0.5m (thay vì 3 vị trí cách 1.5m trước đây) để
@@ -175,12 +184,31 @@ class LivePanel:
         plt.pause(pause)
 
 
-def run_sac(model: SAC, d0: float, psi0: float, obstacle, live: LivePanel, title_prefix: str):
+def _sac_action(policy: RLPolicy, env: FrenetStraightEnv) -> np.ndarray:
+    """Action ở khung THẬT cho env, qua đúng đường của robot (xem docstring
+    module). Obstacle đưa theo (ds tương đối, d) như PlannerLogic."""
+    ds_obs, d_obs, ds_real = env._obstacle_obs()
+    d, psi = float(env.ekf.state.d), float(env.ekf.state.psi)
+    obstacles = [(ds_obs, d_obs)] if math.isfinite(ds_real) else []
+    if obstacles and USE_GATE:
+        free = policy.action(d, psi, [], latch=False)
+        d_target, Ti = decode_action(free, policy.meta)
+        v = env.planner_cfg.target_speed
+        fp = env._build_path(d, v * math.sin(psi), d_target, Ti, v)
+        planner = env._planner
+        if planner._check_paths([fp], obstacles) and planner._obstacle_cost(fp, obstacles) == 0.0:
+            return free
+    return policy.action(d, psi, obstacles)
+
+
+def run_sac(policy: RLPolicy, d0: float, psi0: float, obstacle, live: LivePanel, title_prefix: str):
     """Chạy 1 kịch bản SAC tới hết. Gọi trong process RIÊNG (xem
     _run_method_process/main) nên không cần interleave với cost-based nữa —
     mỗi process chỉ lo đúng 1 phương pháp, chạy thẳng tới hết."""
-    env = FrenetStraightEnv(discretize_d_for_eval=True)
-    obs, _ = env.reset(options={"d0": d0, "psi0": psi0, "obstacle": obstacle})
+    # canonical=False: env nhận action khung THẬT — RLPolicy đã tự lật gương.
+    env = FrenetStraightEnv(config={"canonical": False}, discretize_d_for_eval=True)
+    env.reset(options={"d0": d0, "psi0": psi0, "obstacle": obstacle})
+    policy.latch.reset()
     traj_s = [env.s_ego]
     traj_d = [float(env.ekf.state.d)]
     collided = False
@@ -188,8 +216,7 @@ def run_sac(model: SAC, d0: float, psi0: float, obstacle, live: LivePanel, title
     step_idx = 0
     done = False
     while not done:
-        action, _ = model.predict(obs, deterministic=True)
-        obs, _r, terminated, truncated, info = env.step(action)
+        _obs, _r, terminated, truncated, info = env.step(_sac_action(policy, env))
         step_idx += 1
         traj_s.append(env.s_ego)
         traj_d.append(float(env.ekf.state.d))
@@ -284,7 +311,7 @@ def _run_method_process(method: str, model_path: str, result_queue) -> None:
     chạy THỰC SỰ song song (2 tiến trình OS riêng, có thể trên 2 core khác
     nhau) — khác hẳn interleave trong 1 process (vẫn tuần tự ở mức CPU)."""
     live = LivePanel(name=method)
-    model = SAC.load(model_path) if method == "SAC" else None
+    model = RLPolicy(model_path) if method == "SAC" else None
 
     results = []
     for name, obstacle, d0, psi0 in SCENARIOS:
@@ -334,7 +361,9 @@ def main() -> None:
     ctx = mp.get_context("spawn")
     q_sac: "mp.Queue" = ctx.Queue()
     q_cost: "mp.Queue" = ctx.Queue()
-    p_sac = ctx.Process(target=_run_method_process, args=("SAC", MODEL_PATH, q_sac))
+    model_path = sys.argv[1] if len(sys.argv) > 1 else MODEL_PATH
+    print(f"[RUN] model: {model_path}", flush=True)
+    p_sac = ctx.Process(target=_run_method_process, args=("SAC", model_path, q_sac))
     p_cost = ctx.Process(target=_run_method_process, args=("cost-based", MODEL_PATH, q_cost))
 
     print("[RUN] 2 process song song: SAC + cost-based ...", flush=True)
@@ -366,12 +395,12 @@ def main() -> None:
                 "min_dist_to_obstacle": min_dist if math.isfinite(min_dist) else float("nan"),
             })
 
-    header = f"{'scenario':<18}{'planner':<12}{'collided':<10}{'mean|d|':<10}{'std|d|':<10}{'min_dist':<10}"
+    header = f"{'scenario':<22}{'planner':<12}{'collided':<10}{'mean|d|':<10}{'std|d|':<10}{'min_dist':<10}"
     print(header)
     print("-" * len(header))
     for r in rows:
         print(
-            f"{r['scenario']:<18}{r['planner']:<12}{str(r['collided']):<10}"
+            f"{r['scenario']:<22}{r['planner']:<12}{str(r['collided']):<10}"
             f"{r['mean_abs_d']:<10.3f}{r['std_abs_d']:<10.3f}{r['min_dist_to_obstacle']:<10.3f}"
         )
 

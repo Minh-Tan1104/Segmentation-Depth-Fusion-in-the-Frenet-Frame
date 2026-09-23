@@ -202,15 +202,29 @@ class PlannerLogic:
 
         psi suy ngược từ c_d_d: cả 2 caller (control/node.py, plan()) đều tính
         c_d_d = target_speed*sin(psi), nên asin(c_d_d/target_speed) ra đúng
-        psi (|psi| < 90°) — không cần đổi chữ ký plan_from_state."""
+        psi (|psi| < 90°) — không cần đổi chữ ký plan_from_state.
+
+        Chỉ đưa obstacle cho policy khi CẦN: trước hết hỏi policy như không có
+        obstacle (bám làn); nếu path đó khả thi và không lọt vào clearance của
+        obstacle nào (_obstacle_cost == 0) thì dùng luôn. Policy tự nó né cả
+        obstacle lệch xa mà đi thẳng vẫn an toàn (đo sim, model old: d_obs
+        ±1.4..2.0 m vẫn lệch 0.4-0.65 m, cost-based giữ 0)."""
         speed = self.target_speed
         psi = math.asin(max(-1.0, min(1.0, c_d_d / speed))) if speed > 0.0 else 0.0
-        d_target, Ti = self.rl_policy.select(c_d, psi, obstacles)
-        fp = self.planner.build_path(0.0, speed, c_d, c_d_d, 0.0, d_target, Ti, speed)
-        ok = self.planner._check_paths(
-            self.planner._calc_global_paths([fp]), obstacles, ref_kappa
-        )
-        return ok[0] if ok else None
+
+        def build(obs_for_policy, latch=True):
+            d_target, Ti = self.rl_policy.select(c_d, psi, obs_for_policy, latch=latch)
+            fp = self.planner.build_path(0.0, speed, c_d, c_d_d, 0.0, d_target, Ti, speed)
+            ok = self.planner._check_paths(
+                self.planner._calc_global_paths([fp]), obstacles, ref_kappa
+            )
+            return ok[0] if ok else None
+
+        if obstacles:
+            fp = build([], latch=False)
+            if fp is not None and self.planner._obstacle_cost(fp, obstacles) == 0.0:
+                return fp
+        return build(obstacles)
 
     def plan_on_course(
         self,

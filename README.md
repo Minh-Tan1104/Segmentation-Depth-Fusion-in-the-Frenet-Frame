@@ -186,7 +186,7 @@ under `control_node`:
 
 ```yaml
 plan_use_rl: true        # false = classical Frenet cost-based (default)
-plan_rl_model_path: "~/ros2_ws/src/RL_CAR/models/sac_frenet_straight.zip"
+plan_rl_model_path: "~/ros2_ws/src/RL_CAR/models/sac_frenet_straight_v2.zip"
 ```
 
 It needs `stable-baselines3` and `torch` on the car; they are only imported
@@ -195,55 +195,72 @@ checks (collision, speed, acceleration, curvature). If a path fails, that
 tick falls back to the classical planner and `control_node` logs a warning,
 so an RL mistake never reaches the motors.
 
+Obstacles are only shown to the policy when they matter. Each tick first
+asks the policy for its plain lane-keeping path. If that path is feasible
+and stays outside every obstacle's clearance, it is used as is. Without
+this gate the policy also swerved around obstacles it would have passed
+safely going straight (in sim: 0.4–0.65 m of drift for obstacles 1.4–2 m
+to the side, where the classical planner stays centred).
+
 **How it was trained** — `train_frenet_rl.py` wraps the straight-mode
 planner in a Gymnasium environment:
 
-- **Observation:** `[d, psi, distance to the nearest obstacle ahead, its lateral offset]`.
-- **Reward:** exactly the negative of the classical planner's cost (jerk,
-  time, center offset, obstacle clearance), plus terminal terms for
-  collision, leaving the lane, and reaching the goal. The policy therefore
-  optimises the same objective the classical planner minimises by search.
+- **Observation:** `[d, psi, distance to the nearest obstacle ahead, its
+  lateral offset, obstacle-in-view flag]`, seen in a mirrored frame (below).
+- **Reward:** the negative of the classical planner's cost (jerk, time,
+  centre offset, obstacle clearance) plus a constant per-step bonus, with
+  terminal penalties for collision and leaving the lane. A constant shift
+  does not change which action is cheaper, so the policy optimises the same
+  objective the classical planner minimises by search.
+- **Episodes:** a stream of static obstacles along the road (12–25 m apart,
+  each present with probability 0.7, 20 % of them near the centreline).
 
-The observation/action encoding lives in
+Three design choices fix failures seen in earlier models:
+
+| Problem | Evidence | Fix |
+|---|---|---|
+| A continuous policy has to pass through `d_target ≈ 0` when it switches from "avoid right" to "avoid left", so there is always a band of obstacle positions near the centreline where it drives straight into the obstacle. More training only narrows or moves the band. | Previous model: 18/87 collisions with obstacles within ±0.05 m of the car's line. | **Mirrored frame + side latch.** The policy always sees the obstacle on its left; if it is really on the right, the state is mirrored going in and the action coming out. Picking a side becomes a sign test, and the side is latched per obstacle so sensor noise cannot flip it mid-manoeuvre. |
+| "No obstacle" was encoded exactly like "obstacle on the centreline at the edge of vision". | Erratic lane keeping, no stable point at the lane centre. | Explicit obstacle-in-view flag. |
+| The critic valued being off-centre, so the policy drifted ~0.7 m. A +200 goal bonus at the end of the road made value depend on distance travelled, which the policy cannot observe. Offset also grew with distance (every episode starts near the centre). The policy mistook "offset" for "near the goal". | Remaining return rose from −7.6 at the start to +164 near the goal. Forcing the centre on an empty road scored 90 vs 37 for the policy. | Per-step bonus instead of a goal bonus. The end of the road is a time-limit truncation, not a terminal state. |
+
+The observation/action encoding (including the mirrored frame) lives in
 [`planner_motion/rl_policy.py`](planner_motion/rl_policy.py) and is shared
 by training and the live node. The constants used at training time are saved
 next to the model (`.meta.json`), so decoding on the car matches training
-even if the robot's `plan_*` parameters differ.
+even if the robot's `plan_*` parameters differ. Older models without the new
+meta fields still load and run as before.
 
-Models in `models/`: `sac_frenet_straight.zip` is the one the config
-points to; `sac_frenet_straight_center.zip` is the same policy saved under
-its training-run name; `sac_frenet_straight_old.zip` is the previous policy,
-trained without centred-obstacle oversampling. It holds the lane centre
-better but drives into a centred obstacle.
+Models in `models/`:
+
+- `sac_frenet_straight_v2.zip` — the current model, and the one the config points to.
+- `sac_frenet_straight.zip` / `sac_frenet_straight_center.zip` — the previous model (centred-obstacle oversampling, no mirrored frame). Avoids centred obstacles but drifts ~0.4–0.9 m off the lane centre.
+- `sac_frenet_straight_old.zip` — the model before that. Good lane keeping, but drives into centred obstacles.
 
 ```bash
 pip install -r requirements.txt
-python3 train_frenet_rl.py   # trains, writes models/sac_frenet_straight.zip + .meta.json
-python3 test_frenet_rl.py    # SAC vs classical on 10 fixed scenarios, one process per method
+python3 train_frenet_rl.py            # trains, writes models/sac_frenet_straight.zip + .meta.json
+python3 test_frenet_rl.py [model]     # SAC vs classical on 10 fixed scenarios (default: v2)
 ```
 
-**Results in simulation** (10 scenarios: no obstacle, obstacles swept across
-the lane from −1.5 m to +1.5 m, and ±20° initial heading error; continuous
-actions as used on the car):
+**Results in simulation.** v2 is the final checkpoint (200k steps). The
+second training seed reached the same targets: 0 collisions, lane offset
+0.033 m.
 
-| | Classical (cost-based) | SAC |
-|---|---|---|
-| Collisions | 0 / 10 | 0 / 10 |
-| Planning time per tick | 12.4 ms | 0.96 ms (~13× faster) |
-| Lane-centre offset, no obstacle | 0.00 m | ~0.29 m |
+| | Classical | old | previous | **v2** |
+|---|---|---|---|---|
+| Collisions, obstacle near the car's line (87 runs) | — | 18 | 0 | **0** |
+| Collisions, 400 random episodes with ±0.05 m obstacle noise | — | 73 | — | **0** |
+| Mean lane offset on an empty road (15 start states, ±1.5 m / ±20°) | — | 0.030 m | 0.632 m | **0.022 m** |
+| Max drift for obstacles 1.4–2 m to the side | 0.00 m | 0.04 m | 0.52 m | **0.00 m** |
+| Planning time per tick | 7.9–9.4 ms | | | **0.4–0.75 ms** |
 
-The SAC policy plans much faster and avoids obstacles safely, but it holds
-the lane centre less precisely than the classical planner. An obstacle
-exactly on the centreline is the hardest case: left and right are equally
-good, so a single-mode policy tends to average them and drive straight.
-Oversampling centred obstacles during training reduced collisions there
-from 14/20 to 1/20.
-
-`test_frenet_rl.py` rounds SAC's continuous offset to the classical
-planner's 0.4 m grid for a like-for-like comparison. In the exactly
-symmetric centred-obstacle scenario, that rounding keeps snapping the small
-first corrections back to 0, so the script reports 1/10 collisions for SAC.
-With the continuous actions used on the car, the same scenario passes.
+On the 10 fixed scenarios of `test_frenet_rl.py`, with offsets rounded to
+the classical 0.4 m grid:
+- Both planners had 0/10 collisions.
+- SAC deviated less than the classical planner with a centred obstacle
+  (mean |d| 0.26 vs 0.38 m) and when starting with ±20° heading error
+  (0.16–0.19 vs 0.36 m).
+- The remaining scenarios were within a few cm of each other.
 
 ## Known limitations
 
@@ -256,10 +273,23 @@ With the continuous actions used on the car, the same scenario passes.
   implementation (curved cubic-spline planner), kept for experimentation —
   it is not wired into the live ROS pipeline.
 - The RL lateral planner has only been validated in simulation. The
-  shipped model was trained with the training script's planner settings
-  (2.0 m/s, 3.5–4.0 s horizon), which differ from the robot config (1.0 m/s,
-  2–3 s), so on-car behaviour will differ from the simulation results.
-  Retrain with the robot's settings before relying on it.
+  shipped model was trained with the training script's planner settings,
+  which differ from the robot config:
+
+  | Setting | Training | Robot |
+  |---|---|---|
+  | Speed | 2.0 m/s | 1.0 m/s |
+  | Horizon | 3.5–4.0 s | 2–3 s |
+  | Clearance | 1.2 m | 3.2 m |
+  | Centre weight | 1 | 20 |
+
+  With RL on, the horizon is taken from the model's meta file, not from
+  the config. On-car behaviour will therefore differ from the simulation
+  results. Retrain with the robot's settings before relying on it.
+- The simulation integrates `FrenetEKF.predict` with the velocity sign
+  flipped, because `control/ekf.py` and `control/pure_pursuit.py` use
+  opposite `d_dot` conventions (see the comment in
+  `FrenetStraightEnv.step`). Those two files are left unchanged.
 
 ## License
 
