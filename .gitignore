@@ -17,3 +17,11 @@ plot_data/
 timing/
 plot/
 *.code-workspace
+
+# RL (train_frenet_rl.py / test_frenet_rl.py) — model checkpoint, plots, TensorBoard logs
+models/*
+!models/sac_frenet_straight.zip
+!models/sac_frenet_straight.meta.json
+plots/
+tb_logs/
+.venv/

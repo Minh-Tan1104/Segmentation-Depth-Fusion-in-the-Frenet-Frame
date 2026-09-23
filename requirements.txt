@@ -1,0 +1,10 @@
+setuptools
+scipy
+pyserial
+pyubx2
+pyproj
+gymnasium
+stable-baselines3
+matplotlib
+tensorboard
+opencv-python

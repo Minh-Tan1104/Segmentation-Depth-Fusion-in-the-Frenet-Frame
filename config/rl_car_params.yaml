@@ -107,6 +107,15 @@ control_node:
     ekf_r_psi: 0.0076154                 # measurement noise của psi đo từ perception (= radians(5°)^2)
     planner_rate_hz: 15.0                # tần số planner nội bộ của control_node (_planner_tick) [Hz]
     # --- Frenet Optimal Planner nội bộ: các plan_* khai báo dùng chung ở khối /** đầu file ---
+    # Chọn thuật toán NÉ/chọn lateral offset ở straight mode (curve mode luôn cost-based):
+    #   false = Frenet cost-based truyền thống (enumerate ứng viên + argmin cost)
+    #   true  = policy RL (SAC, train bằng train_frenet_rl.py) chọn (d_target, Ti);
+    #           path RL vẫn qua cùng kiểm tra va chạm/động học, không đạt thì tick đó
+    #           tự rơi về cost-based. Cần stable-baselines3 + torch trên máy.
+    plan_use_rl: false
+    # Đường dẫn TUYỆT ĐỐI tới model .zip (hỗ trợ ~); cần file <tên>.meta.json cạnh nó
+    # (train_frenet_rl.py tự ghi). models/ không được colcon cài vào install/.
+    plan_rl_model_path: "~/ros2_ws/src/RL_CAR/models/sac_frenet_straight.zip"
     # --- GPS assist (Gps/route_ekf.py) — CHỈ dùng d/psi_err từ GPS khi mất
     # vision quá lâu VÀ GPS đủ tin cậy; mặc định TẮT (an toàn), xem
     # control/node.py _planner_tick cho logic chuyển nguồn. GPS không bao

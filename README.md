@@ -6,11 +6,12 @@ YOLO model are fused with depth into a single **Frenet-frame** state
 (`s, d, heading`), which a Frenet Optimal Trajectory planner and pure-pursuit
 controller then track in real time.
 
-> **On the name:** despite "RL_CAR", the pipeline is **rule-based + classical
+> **On the name:** by default the pipeline is **rule-based + classical
 > planning** — YOLO perception, an Extended Kalman Filter, and a Frenet
-> Optimal Trajectory planner. There is no reinforcement-learning component
-> (no gym environment, policy network, or training loop). The name is a
-> holdover from an earlier direction of the project.
+> Optimal Trajectory planner. Reinforcement learning is an **optional,
+> config-switched** component: a SAC policy can replace the straight-mode
+> planner's cost-based choice of lateral offset (see
+> [RL lateral planner](#optional-rl-lateral-planner-sac)).
 
 ## Overview
 
@@ -83,6 +84,10 @@ lookahead point in magenta.
   and a straight-reference mode for ordinary lane following.
 - **Single point of control authority.** Only one node ever publishes
   `/cmd_vel`; every other node is read-only with respect to actuation.
+- **Optional RL lateral planner.** A SAC policy, trained on the planner's
+  own cost function, can pick the straight-mode avoidance offset instead of
+  enumerating candidates — switched by one config flag, with a per-tick
+  fallback to the classical planner.
 
 ## System architecture
 
@@ -128,6 +133,9 @@ RL_CAR/
 ├── map/                 Recorded GPS route CSVs + curve-zone map
 ├── scripts/             Build/run scripts, rosbag tooling, offline plotting utilities
 ├── docs/                 Detailed architecture doc + images used in this README
+├── models/               Trained SAC policy for the optional RL lateral planner (+ .meta.json)
+├── train_frenet_rl.py    Gymnasium env + SAC training for the RL lateral planner (offline, not a ROS node)
+├── test_frenet_rl.py     Evaluates the SAC policy against the classical planner on fixed scenarios
 └── frenet_optimal_trajectory.py   Standalone offline reference planner (not part of the live ROS pipeline)
 ```
 
@@ -163,6 +171,74 @@ model/seg/best.pt
 or point the `RL_CAR_SOURCE_ROOT` environment variable at a source tree that
 already has them (see `perception/model_paths.py`).
 
+## Optional: RL lateral planner (SAC)
+
+In straight mode the classical planner enumerates ~117 candidate
+trajectories (lateral offset × horizon × speed) and keeps the lowest-cost
+one. The RL option replaces that **choice** with a Soft Actor-Critic policy
+that outputs the target lateral offset `d_target` and lateral horizon `Ti`
+directly. Everything else is unchanged: the same quintic/quartic polynomials
+build the single chosen path, the same pure pursuit tracks it, and curve mode
+always stays classical.
+
+**Switching it on** — in [`config/rl_car_params.yaml`](config/rl_car_params.yaml),
+under `control_node`:
+
+```yaml
+plan_use_rl: true        # false = classical Frenet cost-based (default)
+plan_rl_model_path: "~/ros2_ws/src/RL_CAR/models/sac_frenet_straight.zip"
+```
+
+It needs `stable-baselines3` and `torch` on the car; they are only imported
+when the flag is on. Every RL path still goes through the planner's hard
+checks (collision, speed, acceleration, curvature). If a path fails, that
+tick falls back to the classical planner and `control_node` logs a warning,
+so an RL mistake never reaches the motors.
+
+**How it was trained** — `train_frenet_rl.py` wraps the straight-mode
+planner in a Gymnasium environment:
+
+- **Observation:** `[d, psi, distance to the nearest obstacle ahead, its lateral offset]`.
+- **Reward:** exactly the negative of the classical planner's cost (jerk,
+  time, center offset, obstacle clearance), plus terminal terms for
+  collision, leaving the lane, and reaching the goal. The policy therefore
+  optimises the same objective the classical planner minimises by search.
+
+The observation/action encoding lives in
+[`planner_motion/rl_policy.py`](planner_motion/rl_policy.py) and is shared
+by training and the live node. The constants used at training time are saved
+next to the model (`.meta.json`), so decoding on the car matches training
+even if the robot's `plan_*` parameters differ.
+
+```bash
+pip install -r requirements.txt
+python3 train_frenet_rl.py   # trains, writes models/sac_frenet_straight.zip + .meta.json
+python3 test_frenet_rl.py    # SAC vs classical on 10 fixed scenarios, one process per method
+```
+
+**Results in simulation** (10 scenarios: no obstacle, obstacles swept across
+the lane from −1.5 m to +1.5 m, and ±20° initial heading error; continuous
+actions as used on the car):
+
+| | Classical (cost-based) | SAC |
+|---|---|---|
+| Collisions | 0 / 10 | 0 / 10 |
+| Planning time per tick | 12.4 ms | 0.96 ms (~13× faster) |
+| Lane-centre offset, no obstacle | 0.00 m | ~0.29 m |
+
+The SAC policy plans much faster and avoids obstacles safely, but it holds
+the lane centre less precisely than the classical planner. An obstacle
+exactly on the centreline is the hardest case: left and right are equally
+good, so a single-mode policy tends to average them and drive straight.
+Oversampling centred obstacles during training reduced collisions there
+from 14/20 to 1/20.
+
+`test_frenet_rl.py` rounds SAC's continuous offset to the classical
+planner's 0.4 m grid for a like-for-like comparison. In the exactly
+symmetric centred-obstacle scenario, that rounding keeps snapping the small
+first corrections back to 0, so the script reports 1/10 collisions for SAC.
+With the continuous actions used on the car, the same scenario passes.
+
 ## Known limitations
 
 - Encoder odometry is unfiltered dead reckoning — it accumulates drift,
@@ -173,6 +249,11 @@ already has them (see `perception/model_paths.py`).
 - `frenet_optimal_trajectory.py` at the package root is an offline reference
   implementation (curved cubic-spline planner), kept for experimentation —
   it is not wired into the live ROS pipeline.
+- The RL lateral planner has only been validated in simulation. The
+  shipped model was trained with the training script's planner settings
+  (2.0 m/s, 3.5–4.0 s horizon), which differ from the robot config (1.0 m/s,
+  2–3 s), so on-car behaviour will differ from the simulation results.
+  Retrain with the robot's settings before relying on it.
 
 ## License
 

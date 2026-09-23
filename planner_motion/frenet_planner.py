@@ -265,20 +265,52 @@ class FrenetOptimalPlanner:
                     s_dd = lon_qp.calc_second_derivative(t)
                     s_ddd = lon_qp.calc_third_derivative(t)
 
-                    Jp = np.sum(d_ddd**2)
-                    Js = np.sum(s_ddd**2)
-                    ds = (cfg.target_speed - s_d[-1]) ** 2
-
-                    cd = cfg.k_j * Jp + cfg.k_t * Ti + cfg.k_d * (d[-1] - cfg.center_offset) ** 2
-                    cv = cfg.k_j * Js + cfg.k_t * Ti + cfg.k_d * ds
-
                     fp = FrenetPath(
                         t=t, d=d, d_d=d_d, d_dd=d_dd, d_ddd=d_ddd,
                         s=s, s_d=s_d, s_dd=s_dd, s_ddd=s_ddd,
-                        cd=cd, cv=cv, cf=cfg.k_lat * cd + cfg.k_lon * cv,
                     )
+                    fp.cd, fp.cv, fp.cf = FrenetOptimalPlanner._path_cost(fp, cfg, Ti)
                     paths.append(fp)
         return paths
+
+    # ── 1 quỹ đạo DUY NHẤT cho (di, Ti, tv) đã chọn sẵn — đúng thân vòng lặp
+    # _calc_frenet_paths nhưng không enumerate. Dùng khi policy RL (plan_use_rl,
+    # planner_motion/rl_policy.py) đã chọn thẳng (d_target, Ti) thay cho argmin
+    # cost. Trả path frame Frenet (chưa có x/y — caller tự _calc_global_paths).
+    def build_path(self, s0, c_speed, c_d, c_d_d, c_d_dd, di, Ti, tv):
+        cfg = self.config
+        lat_qp = QuinticPolynomial(c_d, c_d_d, c_d_dd, di, 0.0, 0.0, Ti)
+        lon_qp = QuarticPolynomial(s0, c_speed, 0.0, tv, 0.0, Ti)
+        t = np.arange(0.0, Ti, cfg.dt)
+        fp = FrenetPath(
+            t=t,
+            d=lat_qp.calc_point(t),
+            d_d=lat_qp.calc_first_derivative(t),
+            d_dd=lat_qp.calc_second_derivative(t),
+            d_ddd=lat_qp.calc_third_derivative(t),
+            s=lon_qp.calc_point(t),
+            s_d=lon_qp.calc_first_derivative(t),
+            s_dd=lon_qp.calc_second_derivative(t),
+            s_ddd=lon_qp.calc_third_derivative(t),
+        )
+        fp.cd, fp.cv, fp.cf = FrenetOptimalPlanner._path_cost(fp, cfg, Ti)
+        return fp
+
+    # ── cost (cd, cv, cf) của 1 path đơn — tách khỏi vòng lặp enumerate ở
+    # trên để nơi khác (vd train_frenet_rl.py: RL thay phần CHỌN di nhưng
+    # vẫn cần đánh giá cost ĐÚNG công thức gốc cho path mà nó tự sinh) gọi
+    # lại được mà không viết lại công thức. Hành vi enumerate phía trên
+    # không đổi — chỉ tách phép tính, số ra giống hệt trước.
+    @staticmethod
+    def _path_cost(fp: "FrenetPath", cfg: "FrenetPlannerConfig", Ti: float) -> tuple[float, float, float]:
+        Jp = np.sum(fp.d_ddd**2)
+        Js = np.sum(fp.s_ddd**2)
+        ds = (cfg.target_speed - fp.s_d[-1]) ** 2
+
+        cd = cfg.k_j * Jp + cfg.k_t * Ti + cfg.k_d * (fp.d[-1] - cfg.center_offset) ** 2
+        cv = cfg.k_j * Js + cfg.k_t * Ti + cfg.k_d * ds
+        cf = cfg.k_lat * cd + cfg.k_lon * cv
+        return cd, cv, cf
 
     # ── yaw/độ cong numeric từ (fp.x, fp.y) — dùng chung thẳng lẫn cong ──────
     @staticmethod

@@ -14,9 +14,16 @@ before making non-trivial changes; this file only adds what those don't
 ## What this is
 
 Full self-driving stack for a differential-drive car (ROS2 Humble / Jetson
-Orin). Despite the "RL_CAR" name, the pipeline is **rule-based + classical
-planning** (YOLO detection/segmentation + Frenet Optimal Trajectory + EKF) —
-there is no RL component (no gym env, policy network, or training loop).
+Orin). The pipeline is **rule-based + classical planning** (YOLO
+detection/segmentation + Frenet Optimal Trajectory + EKF) by default. One
+optional RL piece: with `plan_use_rl: true` (control_node), straight-mode
+lateral-offset selection uses a SAC policy
+([planner_motion/rl_policy.py](planner_motion/rl_policy.py)) instead of the
+Frenet cost argmin; infeasible RL paths fall back to cost-based per tick,
+curve mode is always cost-based. Training/eval scripts live at the repo root
+(`train_frenet_rl.py`, `test_frenet_rl.py`, outside the ROS package); the model
+needs its `<name>.meta.json` sidecar (obs/action encoding constants from
+training).
 
 ## Commands
 

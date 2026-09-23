@@ -140,6 +140,11 @@ class ControlNode(Node):
         self.declare_parameter("plan_min_horizon_s", 3.5)
         self.declare_parameter("plan_max_horizon_s", 4.0)
         self.declare_parameter("plan_d_road_w", 0.4)
+        # true: straight mode chọn (d_target, Ti) bằng policy RL (SAC) thay cho
+        # hàm cost Frenet; false: Frenet cost-based truyền thống. Curve mode
+        # luôn cost-based. Xem planner_motion/logic.py:_plan_rl.
+        self.declare_parameter("plan_use_rl", False)
+        self.declare_parameter("plan_rl_model_path", "")
         self.declare_parameter("gps_assist_enable", False)
         self.declare_parameter("gps_vision_stale_s", 1.0)
         self.declare_parameter("gps_max_sigma_d", 0.6)
@@ -329,6 +334,16 @@ class ControlNode(Node):
             plan_min_horizon_s=float(self.get_parameter("plan_min_horizon_s").value),
             plan_max_horizon_s=float(self.get_parameter("plan_max_horizon_s").value),
             plan_d_road_w=float(self.get_parameter("plan_d_road_w").value),
+            plan_use_rl=bool(self.get_parameter("plan_use_rl").value),
+            plan_rl_model_path=str(self.get_parameter("plan_rl_model_path").value),
+        )
+        self.get_logger().info(
+            "Straight-mode planner: "
+            + (
+                f"RL (SAC) {self.get_parameter('plan_rl_model_path').value}"
+                if self.planner_logic.rl_policy is not None
+                else "Frenet cost-based"
+            )
         )
 
         self.gps_assist_enable = bool(self.get_parameter("gps_assist_enable").value)
@@ -933,6 +948,11 @@ class ControlNode(Node):
         best, extra = self.planner_logic.plan_from_state(
             d_for_plan, c_d_d, self._latest_detections, ref_kappa=ref_kappa
         )
+        if extra.get("rl_used") is False:
+            self.get_logger().warn(
+                "RL path khong kha thi (va cham/gioi han dong hoc) -> dung Frenet cost-based tick nay",
+                throttle_duration_sec=1.0,
+            )
         if best is None:
             return
 

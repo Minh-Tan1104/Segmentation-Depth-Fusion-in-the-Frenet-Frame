@@ -31,9 +31,21 @@ class PlannerLogic:
         plan_min_horizon_s: float = 3.5,
         plan_max_horizon_s: float = 4.0,
         plan_d_road_w: float = 0.4,
+        plan_use_rl: bool = False,
+        plan_rl_model_path: str = "",
     ) -> None:
         self.plan_enable = plan_enable
         self.plan_lookahead = plan_lookahead
+        # plan_use_rl=true: straight mode (plan_from_state) dùng policy SAC
+        # chọn (d_target, Ti) thay cho enumerate+argmin cost; curve mode
+        # (plan_on_course) KHÔNG đổi. Import lười — torch/stable_baselines3
+        # chỉ cần khi bật. Model thiếu/hỏng -> lỗi ngay lúc khởi tạo node
+        # (không lặng lẽ chạy nhánh khác với cấu hình).
+        self.rl_policy = None
+        if plan_use_rl:
+            from .rl_policy import RLPolicy
+
+            self.rl_policy = RLPolicy(plan_rl_model_path)
         self.planner = FrenetOptimalPlanner(
             FrenetPlannerConfig(
                 target_speed=plan_speed,
@@ -142,9 +154,16 @@ class PlannerLogic:
             d_o = x_o + c_d
             obstacles.append((s_o, d_o))
 
-        best, candidates = self.planner.plan(
-            0.0, c_speed, c_d, c_d_d, 0.0, obstacles, ref_kappa=ref_kappa
-        )
+        best = None
+        candidates = []
+        if self.rl_policy is not None:
+            best = self._plan_rl(c_d, c_d_d, obstacles, ref_kappa)
+            # False = path RL không khả thi, tick này đã rơi về cost-based.
+            frenet_extra["rl_used"] = best is not None
+        if best is None:
+            best, candidates = self.planner.plan(
+                0.0, c_speed, c_d, c_d_d, 0.0, obstacles, ref_kappa=ref_kappa
+            )
 
         # Many candidates share the same lateral target (di) but differ only in
         # duration/speed, so they all converge onto the same endpoint. Keep just
@@ -168,6 +187,30 @@ class PlannerLogic:
         target_d_panel = float(best.d[idx]) if len(best.d) else 0.0
         frenet_extra["optimal_target_d"] = -target_d_panel  # đổi về convention d_meters
         return best, frenet_extra
+
+    def _plan_rl(
+        self,
+        c_d: float,
+        c_d_d: float,
+        obstacles: list[tuple[float, float]],
+        ref_kappa: tuple[np.ndarray, np.ndarray] | None,
+    ):
+        """Policy RL chọn (d_target, Ti), sinh ĐÚNG 1 path bằng build_path (cùng
+        polynomial/cost với cost-based), qua cùng _check_paths (va chạm/tốc độ/
+        gia tốc/độ cong). Trả None nếu path không khả thi — caller rơi về
+        cost-based, nên robot không bao giờ chạy 1 path RL bị loại cứng.
+
+        psi suy ngược từ c_d_d: cả 2 caller (control/node.py, plan()) đều tính
+        c_d_d = target_speed*sin(psi), nên asin(c_d_d/target_speed) ra đúng
+        psi (|psi| < 90°) — không cần đổi chữ ký plan_from_state."""
+        speed = self.target_speed
+        psi = math.asin(max(-1.0, min(1.0, c_d_d / speed))) if speed > 0.0 else 0.0
+        d_target, Ti = self.rl_policy.select(c_d, psi, obstacles)
+        fp = self.planner.build_path(0.0, speed, c_d, c_d_d, 0.0, d_target, Ti, speed)
+        ok = self.planner._check_paths(
+            self.planner._calc_global_paths([fp]), obstacles, ref_kappa
+        )
+        return ok[0] if ok else None
 
     def plan_on_course(
         self,
