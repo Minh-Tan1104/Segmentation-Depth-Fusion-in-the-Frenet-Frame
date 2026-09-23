@@ -210,6 +210,12 @@ by training and the live node. The constants used at training time are saved
 next to the model (`.meta.json`), so decoding on the car matches training
 even if the robot's `plan_*` parameters differ.
 
+Models in `models/`: `sac_frenet_straight.zip` is the one the config
+points to; `sac_frenet_straight_center.zip` is the same policy saved under
+its training-run name; `sac_frenet_straight_old.zip` is the previous policy,
+trained without centred-obstacle oversampling. It holds the lane centre
+better but drives into a centred obstacle.
+
 ```bash
 pip install -r requirements.txt
 python3 train_frenet_rl.py   # trains, writes models/sac_frenet_straight.zip + .meta.json
