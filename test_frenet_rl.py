@@ -2,18 +2,9 @@
 và so sánh với cost-based Frenet planner gốc (planner_motion/frenet_planner.py,
 gọi lại đúng FrenetOptimalPlanner.plan() — không viết lại cost).
 
-Mô phỏng chạy REAL-TIME: mỗi tick (0.5s, = 1 lần replan) vẫn dùng ĐÚNG
-compute_cmd_vel (Pure Pursuit) để tính 1 lệnh (linear_x, angular_z) — y hệt
-luồng train, KHÔNG đổi. Nhưng thay vì chỉ vẽ 1 frame ở CUỐI mỗi tick (state
-nhảy cách quãng), giờ PHÁT LẠI chuyển động TRONG tick đó bằng cách sub-step
-FrenetEKF.predict (tái dùng nguyên, control/ekf.py) ở tần suất
-CONTROL_SUBSTEP_HZ trong khi giữ NGUYÊN lệnh Pure Pursuit đã tính — khớp cách
-hệ thật vận hành: _control_tick (50Hz, control/node.py) tích phân EKF liên
-tục giữa 2 lần _planner_tick (15Hz) cập nhật lệnh lái, tức Pure Pursuit
-"giữ" 1 lệnh lái cố định rồi EKF tích phân mượt heading/vị trí theo lệnh đó
-cho tới lần replan kế tiếp. Việc phát lại này CHỈ để hiển thị (dùng EKF bản
-sao) — không đụng tới state thật của env/planner, nên bảng thống kê cuối
-cùng không đổi so với trước.
+Mô phỏng giống env train (train_frenet_rl.py): tham số planner/pure pursuit
+của robot, mỗi step 0.5 s gồm các tick pure pursuit 40 Hz và đường được lập
+lại mỗi tick. Animation phát lại pose thật của từng tick (info["trace"]).
 
 Khi so sánh: dùng FrenetStraightEnv(discretize_d_for_eval=True) để round
 d_target liên tục của SAC về lưới rời rạc (center_offset + k*d_road_w) mà
@@ -55,9 +46,10 @@ from train_frenet_rl import (
     OverlayRenderer,
     FrenetStraightEnv,
     render_frenet_panel,
+    sim_predict,
 )
 
-MODEL_PATH = os.path.join(MODELS_DIR, "sac_frenet_straight_v2")
+MODEL_PATH = os.path.join(MODELS_DIR, "sac_frenet_straight_robot_s1_50k")
 # Gate như control_node (PlannerLogic._plan_rl): False = policy luôn thấy vật cản.
 USE_GATE = True
 
@@ -80,12 +72,6 @@ SCENARIOS += [
     ("heading_offset_right", None, 0.0, math.radians(-20.0)),
 ]
 
-# Khớp control_rate_hz mặc định của control/node.py — tần suất EKF.predict
-# TÍCH PHÂN VẬT LÝ trong lúc Pure Pursuit giữ nguyên 1 lệnh lái giữa 2 lần
-# replan (planner_rate_hz=15Hz trong hệ thật). Chỉ dùng để chia nhỏ chuyển
-# động cho animation, không ảnh hưởng state thật.
-CONTROL_SUBSTEP_HZ = 50.0
-
 # Tần suất THỰC SỰ VẼ LÊN MÀN HÌNH lại thấp hơn nhiều — draw_frenet_panel +
 # Tk draw_idle/flush_events có overhead đáng kể (đo thật: vẽ 1 panel ~4ms,
 # nhưng round-trip qua Tk event loop mỗi lần gọi mới là phần chậm). 10Hz vẫn
@@ -103,47 +89,21 @@ PLAYBACK_SPEED = 4.0
 
 
 def _animate_substeps(live: "LivePanel", info: dict, title: str) -> None:
-    """Phát lại chuyển động TRONG 1 tick bằng FrenetEKF.predict (tái dùng
-    nguyên, control/ekf.py) trên 1 bản sao EKF — giữ NGUYÊN lệnh Pure Pursuit
-    (info["linear_x"]/["angular_z"], đã tính 1 lần cho cả tick, KHÔNG tính
-    lại) trong khi tích phân từng bước nhỏ, để heading/vị trí xe trên panel
-    đổi liên tục thay vì nhảy cách quãng theo tick. Path/obstacle hiển thị
-    giữ nguyên như tick đó (đúng: chỉ replan mỗi tick, không phải mỗi
-    substep) — chỉ có pose xe (d/psi/s) di chuyển dọc theo path đã sinh.
-
-    Tích phân vật lý mỗi substep (CONTROL_SUBSTEP_HZ) nhưng chỉ VẼ mỗi
-    render_every_n substep (RENDER_HZ, thấp hơn) — vật lý mượt/đúng, hiển thị
-    đỡ tốn overhead Tk."""
-    dt = ENV_CONFIG["dt"]
-    n_sub = max(1, round(dt * CONTROL_SUBSTEP_HZ))
-    sub_dt = dt / n_sub
-    render_every_n = max(1, round(CONTROL_SUBSTEP_HZ / RENDER_HZ))
-    # tổng pause/tick ≈ dt/PLAYBACK_SPEED (dt = real-time, chia thêm tốc độ
-    # phát lại mong muốn).
-    render_pause = render_every_n * sub_dt / PLAYBACK_SPEED
-    linear_x = info["linear_x"]
-    angular_z = info["angular_z"]
-
-    ekf = FrenetEKF()
-    ekf.x = np.array([info["d_before"], info["psi_before"]])
-    s_ego = info["s_ego_before"]
-    for i in range(n_sub):
-        psi_now = float(ekf.state.psi)
-        # v_odom=-linear_x: bù lệch quy ước d_dot giữa control/ekf.py và
-        # control/pure_pursuit.py — xem comment chi tiết ở
-        # train_frenet_rl.py:FrenetStraightEnv.step(). Chỉ trong mô phỏng
-        # RL, không sửa 2 file gốc.
-        ekf.predict(v_odom=-linear_x, omega_odom=angular_z, dt=sub_dt)
-        s_ego += linear_x * math.cos(psi_now) * sub_dt
-
-        is_last = i == n_sub - 1
-        if not is_last and (i + 1) % render_every_n != 0:
-            continue  # vẫn tích phân, chỉ bỏ qua vẽ khung này
-
+    """Phát lại chuyển động TRONG 1 step từ info["trace"] — pose (s, d, psi)
+    thật sau mỗi tick pure pursuit (ENV_CONFIG["pp_rate_hz"]), do env/vòng
+    cost-based ghi lại. Path/obstacle hiển thị giữ như đầu step. Chỉ VẼ mỗi
+    render_every_n tick (RENDER_HZ) cho đỡ tốn overhead Tk."""
+    trace = info.get("trace") or [(info["s_ego_before"], info["d_before"], info["psi_before"])]
+    tick_dt = ENV_CONFIG["dt"] / len(trace)
+    render_every_n = max(1, round(1.0 / (RENDER_HZ * tick_dt)))
+    render_pause = render_every_n * tick_dt / PLAYBACK_SPEED
+    for i, (s_now, d_now, psi_now) in enumerate(trace):
+        if i != len(trace) - 1 and (i + 1) % render_every_n != 0:
+            continue
         sub_info = dict(info)
-        sub_info["d_before"] = float(ekf.state.d)
-        sub_info["psi_before"] = float(ekf.state.psi)
-        sub_info["s_ego_before"] = s_ego
+        sub_info["d_before"] = d_now
+        sub_info["psi_before"] = psi_now
+        sub_info["s_ego_before"] = s_now
         live.update(sub_info, title=title, pause=render_pause)
 
 
@@ -244,58 +204,62 @@ def run_cost_based(d0: float, psi0: float, obstacle, live: LivePanel, title_pref
     min_dist = math.inf
     step_idx = 0
 
+    n_sub = max(1, round(cfg["dt"] * cfg["pp_rate_hz"]))
+    sub_dt = cfg["dt"] / n_sub
+    c_speed = PLANNER_CFG.target_speed
     for _ in range(cfg["max_episode_steps"]):
-        d = float(ekf.state.d)
-        psi = float(ekf.state.psi)
-        c_speed = PLANNER_CFG.target_speed
-        c_d_d = c_speed * math.sin(psi)
-
-        obstacles_relative = []
-        if obstacle is not None:
-            s_obs_abs, d_obs = obstacle
-            obstacles_relative.append((s_obs_abs - s_ego, d_obs))
-
-        best, _candidates = planner.plan(0.0, c_speed, d, c_d_d, 0.0, obstacles_relative)
-        if best is None:
-            collided = True
+        # 1 "step" hiển thị = dt; bên trong pure pursuit chạy pp_rate_hz và
+        # Frenet lập đường lại MỖI tick (như robot, xem env RL).
+        d_first, psi_first, s_first = float(ekf.state.d), float(ekf.state.psi), s_ego
+        first = None
+        trace = []
+        for _k in range(n_sub):
+            d = float(ekf.state.d)
+            psi = float(ekf.state.psi)
+            obstacles_relative = []
+            if obstacle is not None:
+                s_obs_abs, d_obs = obstacle
+                obstacles_relative.append((s_obs_abs - s_ego, d_obs))
+            best, _candidates = planner.plan(0.0, c_speed, d, c_speed * math.sin(psi), 0.0, obstacles_relative)
+            if best is None:
+                collided = True
+                break
+            min_dist = min(min_dist, FrenetStraightEnv._closest_obstacle_dist(best, obstacles_relative))
+            linear_x, angular_z, target_s, target_d = compute_cmd_vel(
+                best.s, best.d, 0.0, d, psi, c_speed, PP_CFG,
+            )
+            if first is None:
+                first = (best, target_s, target_d, linear_x, angular_z)
+            sim_predict(ekf, linear_x, angular_z, sub_dt)
+            s_ego += linear_x * math.cos(psi) * sub_dt
+            trace.append((s_ego, float(ekf.state.d), float(ekf.state.psi)))
+        if first is None:
             break
-        min_dist = min(min_dist, FrenetStraightEnv._closest_obstacle_dist(best, obstacles_relative))
-
-        linear_x, angular_z, target_s, target_d = compute_cmd_vel(
-            best.s, best.d, 0.0, d, psi, c_speed, PP_CFG,
-        )
-        s_ego_before = s_ego
-        # v_odom=-linear_x: bù lệch quy ước d_dot giữa control/ekf.py và
-        # control/pure_pursuit.py — xem comment chi tiết ở
-        # train_frenet_rl.py:FrenetStraightEnv.step(). Chỉ trong mô phỏng
-        # RL, không sửa 2 file gốc.
-        ekf.predict(v_odom=-linear_x, omega_odom=angular_z, dt=cfg["dt"])
-        s_ego += linear_x * math.cos(psi) * cfg["dt"]
+        best, target_s, target_d, linear_x, angular_z = first
         step_idx += 1
         traj_s.append(s_ego)
         traj_d.append(float(ekf.state.d))
 
         # info tương thích render_frenet_panel — cost-based không có "Ti"
-        # tường minh trên FrenetPath (chỉ enumerate rồi bỏ), suy ra gần đúng
-        # từ mẫu thời gian cuối path (best.t[-1] + dt ≈ Ti, xem
-        # _calc_frenet_paths: t=arange(0, Ti, dt)) — chỉ dùng để vẽ quạt
-        # minh hoạ, không ảnh hưởng path/cost thật.
+        # tường minh trên FrenetPath, suy ra gần đúng từ mẫu thời gian cuối
+        # path (best.t[-1] + dt ≈ Ti) — chỉ để vẽ quạt minh hoạ.
         info = {
             "path_d": best.d.tolist(),
             "path_s": best.s.tolist(),
-            "d_before": d,
-            "psi_before": psi,
-            "s_ego_before": s_ego_before,
+            "d_before": d_first,
+            "psi_before": psi_first,
+            "s_ego_before": s_first,
             "Ti": float(best.t[-1] + PLANNER_CFG.dt) if len(best.t) else PLANNER_CFG.min_t,
             "target_s": target_s,
             "target_d": target_d,
             "obstacle": obstacle,
             "linear_x": linear_x,
             "angular_z": angular_z,
+            "trace": trace,
         }
         _animate_substeps(live, info, title=f"{title_prefix} (cost-based) step={step_idx}")
 
-        if abs(float(ekf.state.d)) > cfg["d_max_offset_m"]:
+        if collided or abs(float(ekf.state.d)) > cfg["d_max_offset_m"]:
             break
         if s_ego >= cfg["course_length_m"]:
             break

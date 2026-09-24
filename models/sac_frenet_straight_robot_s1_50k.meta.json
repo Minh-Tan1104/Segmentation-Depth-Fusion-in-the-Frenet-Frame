@@ -1,0 +1,11 @@
+{
+  "center_offset": 0.0,
+  "d_min": -2.4000000000000004,
+  "d_max": 2.4000000000000004,
+  "min_t": 2.0,
+  "max_t": 3.0,
+  "vision_range_m": 8.0,
+  "obs_version": 2,
+  "canonical": true,
+  "side_switch_m": 0.3
+}

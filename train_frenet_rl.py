@@ -79,26 +79,44 @@ from visualization.logic import OverlayRenderer
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Cấu hình planner — khớp ĐÚNG default ROS param của planner_motion/node.py
-# (Declare các "plan_*" param) để RL và cost-based planner so sánh công bằng
-# trên cùng 1 bộ giới hạn/candidate range. Field không expose qua ROS param
-# (k_j, k_t, k_lat, k_lon, dt, d_t_s, n_s_sample, min_path_*) giữ nguyên
-# default của FrenetPlannerConfig, vì deployment thật cũng dùng default đó.
+# Cấu hình planner + pure pursuit — ĐỌC THẲNG từ config/rl_car_params.yaml
+# (khối "/**" + "control_node"), cùng ánh xạ plan_* -> FrenetPlannerConfig
+# như PlannerLogic.__init__, để RL train đúng hàm chi phí/giới hạn mà Frenet
+# trên robot dùng. Field không expose qua ROS param (k_j, k_t, k_lat, k_lon,
+# dt, …) giữ default FrenetPlannerConfig, như trên robot.
 # ─────────────────────────────────────────────────────────────────────────
-PLANNER_CFG = FrenetPlannerConfig(
-    target_speed=2.0,          # plan_speed
-    max_speed=2.0 * 1.5,       # planner_motion/logic.py: max_speed=plan_speed*1.5
-    robot_radius=0.6,          # plan_robot_radius
-    max_road_width=2.5,        # plan_road_width
-    d_road_w=0.4,              # plan_d_road_w
-    max_curvature=1.5,         # plan_max_curvature
-    clearance=1.2,             # plan_clearance
-    k_obs=10.0,                # plan_obstacle_weight
-    center_offset=0.0,         # plan_center_offset
-    k_d=1.0,                   # plan_center_weight
-    min_t=3.5,                 # plan_min_horizon_s
-    max_t=4.0,                 # plan_max_horizon_s
-)
+ROBOT_PARAMS_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "config", "rl_car_params.yaml")
+
+
+def robot_config(path: str = ROBOT_PARAMS_YAML):
+    """(FrenetPlannerConfig, PurePursuitConfig) như control_node dựng từ yaml."""
+    import yaml
+    with open(path) as f:
+        doc = yaml.safe_load(f)
+    p = {**doc["/**"]["ros__parameters"], **doc["control_node"]["ros__parameters"]}
+    planner_cfg = FrenetPlannerConfig(
+        target_speed=p["plan_speed"],
+        max_speed=p["plan_speed"] * 1.5,   # planner_motion/logic.py
+        robot_radius=p["plan_robot_radius"],
+        max_road_width=p["plan_road_width"],
+        d_road_w=p["plan_d_road_w"],
+        max_curvature=p["plan_max_curvature"],
+        clearance=p["plan_clearance"],
+        k_obs=p["plan_obstacle_weight"],
+        center_offset=p["plan_center_offset"],
+        k_d=p["plan_center_weight"],
+        min_t=p["plan_min_horizon_s"],
+        max_t=p["plan_max_horizon_s"],
+    )
+    pp_cfg = PurePursuitConfig(
+        lookahead_distance=p["lookahead_distance"],
+        max_wheel_speed=p["max_wheel_speed"],
+    )
+    return planner_cfg, pp_cfg
+
+
+PLANNER_CFG, PP_CFG = robot_config()
 # Khoảng lateral offset ứng viên mà cost-based planner đang dùng (xem
 # _calc_frenet_paths: n_steps=round(max_road_width/d_road_w), di =
 # center_offset ± n_steps*d_road_w) — RL action map vào ĐÚNG khoảng này để
@@ -107,18 +125,12 @@ _N_STEPS = max(1, round(PLANNER_CFG.max_road_width / PLANNER_CFG.d_road_w))
 D_MAX_OFFSET = PLANNER_CFG.center_offset + _N_STEPS * PLANNER_CFG.d_road_w  # = 2.4
 D_MIN_OFFSET = PLANNER_CFG.center_offset - _N_STEPS * PLANNER_CFG.d_road_w  # = -2.4
 
-PP_CFG = PurePursuitConfig()  # default dataclass — chưa có override ROS param cụ thể
-
-# Tầm nhìn obstacle của observation (POMDP: vật lý luôn "có thật" trong env kể
-# cả ngoài tầm nhìn, chỉ observation bị giới hạn). Khớp ĐÚNG khoảng xa nhất mà
-# 1 quỹ đạo/tick THỰC SỰ vươn tới được (Ti*target_speed, Ti∈[min_t,max_t]=
-# [3.5,4.0]s, target_speed=2m/s -> path dài 7-8m) — trước đây để 15.0 (xa hơn
-# nhiều so với path 1 tick có thể chạm tới) khiến obstacle "thấy được" rất
-# lâu trước khi path nào có thể phản ứng, tạo nhiễu dư khiến policy học lệch
-# tâm nhẹ ngay cả ở đoạn chưa cần né (xem lịch sử debug: d trôi tới +0.53m
-# lúc obstacle CÒN NGOÀI TẦM NHÌN CŨ 15m, tức không phải do rò obstacle — mà
-# do noise huấn luyện tích luỹ từ việc thấy obstacle quá sớm/quá lâu).
-VISION_RANGE_M = PLANNER_CFG.max_t * PLANNER_CFG.target_speed  # = 8.0
+# Tầm nhìn obstacle của observation (POMDP: vật lý luôn "có thật" trong env,
+# chỉ observation bị giới hạn). Cố định 8 m như các model trước (trước đây =
+# max_t*target_speed với tham số train cũ); với tham số robot công thức đó chỉ
+# còn 3 m — ngắn hơn clearance 3.2 m. Giá trị này lưu vào meta, RL trên xe
+# chỉ nhìn vật cản trong tầm này.
+VISION_RANGE_M = 8.0
 
 # Hằng số mã hoá observation/action — lưu cạnh model (.meta.json) để lúc chạy
 # thật (control_node, plan_use_rl=true) giải mã y hệt lúc train.
@@ -186,9 +198,16 @@ ENV_CONFIG = {
     "vision_range_m": VISION_RANGE_M,
     "d_max_offset_m": D_MAX_OFFSET,     # = 2.4 — cũng dùng làm ngưỡng "lệch khỏi làn"
 
-    "r_collision": 100.0,   # phạt lớn khi path không khả thi (va chạm HOẶC
-                             # vi phạm tốc độ/gia tốc/độ cong — xem _check_paths)
-    "r_offlane": 50.0,      # phạt khi |d| vượt d_max_offset_m (kết thúc episode)
+    # Phạt kết thúc phải ĐẮT HƠN chi phí vượt qua 1 vật cản, nếu không policy
+    # học cố tình đâm/lao khỏi làn để né chi phí đó. Với chi phí robot (k_obs
+    # 20, clearance 3.2 m) vượt 1 vật cản tốn ~860 (tới -57/step) — r_collision
+    # 100 cũ < 860 + ~95 thưởng tương lai. 3000 dư an toàn cho chuỗi vật cản.
+    "r_collision": 3000.0,  # path không khả thi (va chạm HOẶC vi phạm tốc
+                             # độ/gia tốc/độ cong — xem _check_paths)
+    "r_offlane": 3000.0,    # |d| vượt d_max_offset_m (kết thúc episode)
+    # Nhân toàn bộ reward (sau khi cộng các thành phần) — giữ giá trị Q ở
+    # thang vừa phải cho SAC; không đổi thứ tự tốt/xấu giữa các action.
+    "reward_scale": 0.05,
     # r_goal=200 (không phải 50): đo thật cho thấy cost/step trung bình khi
     # lái tốt ~0.7-2.3 (chủ yếu do k_t*Ti — "phí thời gian" luôn cộng dồn dù
     # không lệch tâm/không obstacle); course_length=60m ở target_speed=2m/s
@@ -205,7 +224,7 @@ ENV_CONFIG = {
     # còn lại -7.6 lúc đầu đường -> +164 gần đích, trong khi |d| cũng tăng
     # theo quãng đường (mọi episode xuất phát gần tâm) -> critic gán giá trị
     # cao cho "lệch" (policy trôi ~0.7m dù giữ tâm cho return thật cao hơn).
-    # r_alive=2 > cost/step lúc lái tốt (~0.7-1.3) nên reward/step dương:
+    # r_alive=2 > cost/step lúc lái tốt (~0.5 với tham số robot) nên reward/step dương:
     # "thoát sớm" bằng off-lane/va chạm luôn mất phần thưởng tương lai — đúng
     # vai trò r_goal từng giữ, nhưng không phụ thuộc vị trí trên đường.
     "r_alive": 2.0,
@@ -227,6 +246,8 @@ ENV_CONFIG = {
     "first_obstacle_s_m": (10.0, 25.0),
     "obstacle_gap_m": (12.0, 25.0),
     "obstacle_prob": 0.7,
+    # Tần số pure pursuit trong mỗi step (robot: 40 Hz). Đường lập lại mỗi tick.
+    "pp_rate_hz": 40.0,
     "init_d_range_m": 0.3,
     "init_psi_range_deg": 5.0,
     # False: env nhận action ở khung THẬT (dùng khi đánh giá qua RLPolicy,
@@ -259,6 +280,20 @@ SAC_KWARGS = dict(
     sde_sample_freq=8,
     verbose=1,
 )
+
+
+def sim_predict(ekf: FrenetEKF, linear_x: float, angular_z: float, dt: float) -> None:
+    """Tích phân 1 bước chuyển động trong mô phỏng RL.
+
+    FrenetEKF.predict giữ NGUYÊN (d_dot = -v*sin(psi), psi_dot = +omega;
+    quy ước +d = phải, -d = trái). Lệnh angular_z của pure pursuit được ĐẢO
+    DẤU trước khi tích phân. Với tham số robot (config/rl_car_params.yaml:
+    lookahead 0.8 m, plan_speed 1.0, horizon 2-3 s, k_d 20), đây là tổ hợp
+    dấu duy nhất mà Frenet cost-based bám được làn (mean|d| 0.006 m); 3 tổ
+    hợp còn lại trôi 1.4-3 m hoặc phân kỳ. Mẹo cũ (v_odom=-linear_x) chỉ ổn
+    định nhờ lookahead mặc định dài 3 m. Chỉ trong mô phỏng — không sửa
+    control/ekf.py hay control/pure_pursuit.py."""
+    ekf.predict(v_odom=linear_x, omega_odom=-angular_z, dt=dt)
 
 
 def _round_to_grid(d_value: float, d_road_w: float, center_offset: float) -> float:
@@ -380,28 +415,34 @@ class FrenetStraightEnv(gym.Env):
         # k_obs*obstacle_cost) — reuse nguyên _obstacle_cost, không viết lại.
         cost = fp.cf + self.planner_cfg.k_obs * self._planner._obstacle_cost(fp, obstacles_relative)
 
-        linear_x, angular_z, target_s, target_d = compute_cmd_vel(
-            fp.s, fp.d, 0.0, d_before, psi_before, c_speed, PP_CFG,
-        )
-        # Kinematics d/psi: reuse NGUYÊN VẸN FrenetEKF.predict (cùng quy ước
-        # dấu +d=phải reference, psi panel=-psi_ROS như control/ekf.py).
-        #
-        # v_odom TRUYỀN ÂM (-linear_x), CHỈ ở đây (predict), không đụng file
-        # control/ekf.py hay control/pure_pursuit.py: 2 file đó dùng 2 quy
-        # ước d_dot NGƯỢC NHAU (đã verify bằng thực nghiệm — xem lịch sử
-        # debug) — predict() tích phân d_dot=-v*sin(psi), còn compute_cmd_vel
-        # (heading_gain*psi_now, comment "d_dot=v*sin(psi)") được thiết kế
-        # theo d_dot=+v*sin(psi) (khớp planner_motion/logic.py: c_d_d =
-        # target_speed*sin(hdg), KHÔNG có dấu trừ). Gọi predict() nguyên vẹn
-        # với v_odom=-linear_x cho ra đúng d_dot=+v*sin(psi) mà pure_pursuit
-        # cần để vòng lặp hội tụ (đã verify: dùng đúng dấu gốc thì d/psi
-        # PHÂN KỲ ngay cả với lệch heading nhỏ 5°; đảo dấu ở đây thì hội tụ
-        # ổn định). CHỈ áp dụng trong phạm vi mô phỏng RL — không sửa 2 file
-        # gốc vì chúng ảnh hưởng robot thật, chưa rõ đây là bug hay có ngữ
-        # cảnh bù trừ khác ở hệ thật (theo yêu cầu người dùng).
-        self.ekf.predict(v_odom=-linear_x, omega_odom=angular_z, dt=cfg["dt"])
-        delta_s = linear_x * math.cos(psi_before) * cfg["dt"]
-        self.s_ego += delta_s
+        # 1 quyết định giữ trong dt (0.5 s), nhưng pure pursuit ra lệnh ở
+        # pp_rate_hz (40 Hz như robot) và đường được lập LẠI mỗi tick từ
+        # trạng thái hiện tại với cùng (d_target, Ti) — trên robot planner lập
+        # đường liên tục, lookahead 0.8 m không ổn định nếu giữ 1 lệnh 0.5 s.
+        n_sub = max(1, round(cfg["dt"] * cfg["pp_rate_hz"]))
+        sub_dt = cfg["dt"] / n_sub
+        s_ego_before = self.s_ego
+        path = fp
+        trace = []  # (s_ego, d, psi) sau mỗi tick — chỉ để hiển thị
+        for k in range(n_sub):
+            d_now, psi_now = float(self.ekf.state.d), float(self.ekf.state.psi)
+            if k > 0:
+                path = self._build_path(d_now, c_speed * math.sin(psi_now), d_target, Ti, c_speed)
+                obs_now = [(s_o - self.s_ego, d_o) for s_o, d_o in self._obstacles]
+                if not self._planner._check_paths([path], obs_now):
+                    feasible = False
+                    break
+            linear_x, angular_z, t_s, t_d = compute_cmd_vel(
+                path.s, path.d, 0.0, d_now, psi_now, c_speed, PP_CFG,
+            )
+            if k == 0:
+                target_s, target_d = t_s, t_d
+            # Kinematics d/psi: FrenetEKF.predict nguyên vẹn (quy ước +d =
+            # phải, -d = trái), pure pursuit đảo dấu — xem sim_predict.
+            sim_predict(self.ekf, linear_x, angular_z, sub_dt)
+            self.s_ego += linear_x * math.cos(psi_now) * sub_dt
+            trace.append((self.s_ego, float(self.ekf.state.d), float(self.ekf.state.psi)))
+        delta_s = self.s_ego - s_ego_before
 
         self._update_current_obstacle()
         d_after = float(self.ekf.state.d)
@@ -410,6 +451,7 @@ class FrenetStraightEnv(gym.Env):
         reward, terminated, info = self._reward_and_done(
             d_after, psi_after, feasible, cost, closest_dist
         )
+        reward *= cfg["reward_scale"]
         self.step_count += 1
         truncated = (self.step_count >= cfg["max_episode_steps"] or info["reached_goal"]) and not terminated
 
@@ -431,6 +473,7 @@ class FrenetStraightEnv(gym.Env):
         # test_frenet_rl.py:_animate_substeps), không ảnh hưởng state/reward.
         info["linear_x"] = linear_x
         info["angular_z"] = angular_z
+        info["trace"] = trace
 
         return self._obs(), reward, terminated, truncated, info
 
