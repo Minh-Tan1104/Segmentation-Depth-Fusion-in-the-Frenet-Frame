@@ -186,7 +186,7 @@ under `control_node`:
 
 ```yaml
 plan_use_rl: true        # false = classical Frenet cost-based (default)
-plan_rl_model_path: "~/ros2_ws/src/RL_CAR/models/sac_frenet_straight_multi_s1_200k.zip"
+plan_rl_model_path: "~/ros2_ws/src/RL_CAR/models/sac_frenet_straight_parity_s1_150k.zip"
 ```
 
 It needs `stable-baselines3` and `torch` on the car; they are only imported
@@ -198,7 +198,8 @@ so an RL mistake never reaches the motors.
 Obstacles are only shown to the policy when they matter. Each tick first
 asks the policy for its plain lane-keeping path. The gate extends that path
 to the end of the vision range at its final offset. If the path is feasible
-and every obstacle stays outside its clearance, the path is used as is.
+and every obstacle stays at least 0.9 m (robot radius 0.6 + 0.3 m margin,
+the same gap the feasibility rules require) from it, the path is used as is.
 Without this gate the policy swerved around obstacles it could have passed
 going straight. The extension matters with the robot's settings: a path is
 only 2–3 m long, while obstacles are visible up to 8 m. Checking the short
@@ -228,6 +229,9 @@ planner in a Gymnasium environment:
 - **Timing:** each RL decision is held for 0.5 s. Inside it, pure pursuit
   runs at 40 Hz and the path is rebuilt from the current state on every tick.
   On the car the policy is queried on every planner tick.
+- **Action shaping:** the offset output goes through a signed square
+  (`action_power: 2`) before scaling to `d_target`, so small outputs map
+  to a near-zero offset and the empty-road lane keeping is exact.
 - **Terminal penalties** (collision, leaving the lane) are 3000, and all
   rewards are scaled by 0.05. With the robot's obstacle cost, passing one
   obstacle costs ~460 (clearance 1.2 m), so smaller penalties would make
@@ -255,6 +259,8 @@ Three design choices fix failures seen in earlier models:
 | A continuous policy has to pass through `d_target ≈ 0` when it switches from "avoid right" to "avoid left", so there is always a band of obstacle positions near the centreline where it drives straight into the obstacle. More training only narrows or moves the band. | Previous model: 18/87 collisions with obstacles within ±0.05 m of the car's line. | **Mirrored frame + side latch.** The policy always sees the obstacle on its left; if it is really on the right, the state is mirrored going in and the action coming out. Picking a side becomes a sign test, and the side is latched per obstacle so sensor noise cannot flip it mid-manoeuvre. |
 | "No obstacle" was encoded exactly like "obstacle on the centreline at the edge of vision". | Erratic lane keeping, no stable point at the lane centre. | Explicit obstacle-in-view flag. |
 | The critic valued being off-centre, so the policy drifted ~0.7 m. A +200 goal bonus at the end of the road made value depend on distance travelled, which the policy cannot observe. Offset also grew with distance (every episode starts near the centre). The policy mistook "offset" for "near the goal". | Remaining return rose from −7.6 at the start to +164 near the goal. Forcing the centre on an empty road scored 90 vs 37 for the policy. | Per-step bonus instead of a goal bonus. The end of the road is a time-limit truncation, not a terminal state. |
+| The gate used the 1.2 m planning clearance. Layouts with a gap between 0.9 and 1.2 m wide always reached the policy, which then learned to swerve wide everywhere. | Previous model: some layouts the classical planner passes were failed by SAC. | Gate at 0.9 m, the same gap rule R3/R4 uses. |
+| A linear offset output left a small constant bias on an empty road. | Previous model: lane offset 0.06 m. | Signed-square action mapping (`action_power: 2`). |
 
 The observation/action encoding (including the mirrored frame) lives in
 [`planner_motion/rl_policy.py`](planner_motion/rl_policy.py) and is shared
@@ -263,23 +269,21 @@ next to the model (`.meta.json`), so decoding on the car matches training
 even if the robot's `plan_*` parameters differ. Older models without the new
 meta fields still load and run as before.
 
-Models in `models/`:
-
-- `sac_frenet_straight_multi_s1_200k.zip` — the current model, and the one the config points to. Robot settings, clearance 1.2 m, 1–3 obstacle clusters, 3-obstacle observation, seed 1, 200k steps.
-- `sac_frenet_straight_robot_s1_50k.zip` — the previous model: robot settings with clearance 3.2 m, one obstacle at a time, 50k steps.
-- `sac_frenet_straight_v2.zip` — same design, but trained on the earlier simulation (training-script planner settings, old sign handling, 2 Hz pure pursuit). Its results below do not transfer to the car.
-- `sac_frenet_straight.zip` / `sac_frenet_straight_center.zip` — the previous model (centred-obstacle oversampling, no mirrored frame). Avoids centred obstacles but drifts ~0.4–0.9 m off the lane centre.
-- `sac_frenet_straight_old.zip` — the model before that. Good lane keeping, but drives into centred obstacles.
+Model in `models/`: `sac_frenet_straight_parity_s1_150k.zip` (+ `.meta.json`),
+the one the config points to. Robot settings, clearance 1.2 m, 1–3 obstacle
+clusters, 3-obstacle observation, gate at 0.9 m, `action_power: 2`, seed 1,
+150k steps. Earlier models were removed from the repo; they are still in the
+git history.
 
 ```bash
 pip install -r requirements.txt
 python3 train_frenet_rl.py            # trains, writes models/sac_frenet_straight.zip + .meta.json
-python3 test_frenet_rl.py [model] [--set single|multi|hard|all]   # animated, SAC and classical side by side
+python3 test_frenet_rl.py [model] [--set single|multi|hard|all|report] [--video DIR] [--horizon T]   # animated, SAC and classical side by side
 python3 compare_rl_frenet.py [model] [--multi]                      # tables: left / right / centre / none, or multi-obstacle
 ```
 
 **Results in simulation (robot settings, clearance 1.2 m).** Model
-`sac_frenet_straight_multi_s1_200k`. Both planners replan every tick, and
+`sac_frenet_straight_parity_s1_150k`. Both planners replan every tick, and
 pure pursuit runs at 40 Hz. "SAC" means the logic used on the car: the
 gate, the policy, the hard checks, and a fallback to the classical planner
 on any tick where the RL path is rejected.
@@ -288,18 +292,20 @@ on any tick where the RL path is rejected.
 
 | | Classical planner | SAC |
 |---|---|---|
-| Failures | **122/200**, all "no feasible path" | **3/200** |
-| Min distance to obstacles (5th percentile) | — | 0.98 m |
-| Planning time per tick | ~15 ms | 0.6 ms |
-| Ticks that fell back to classical | — | 0.1 % |
+| Failures | **122/200**, all "no feasible path" | **2/200** |
+| Min distance to obstacles (5th percentile) | — | 0.93 m |
+| Mean \|d\| | — | 0.15 m |
+| Planning time per tick | ~15 ms | 0.8 ms |
+| Ticks that fell back to classical | — | 0.06 % |
 
-Of the 3 SAC failures, the classical planner alone also fails one.
-Without the fallback, the policy alone fails 7/200.
+The classical planner also fails both SAC failures. Over every layout the
+classical planner passes (78 generated + 15 hand-built), SAC fails **none**.
+Without the fallback, the policy alone fails 10/200.
 
 Single obstacle:
 - Policy alone: 0/87 collisions for obstacles near the car's line, and
   0/400 over random episodes with ±0.05 m obstacle measurement noise.
-- Empty road: lane offset 0.06 m (classical ≈ 0.00 m).
+- Empty road: lane offset 0.00 m (same as classical).
 
 Why the classical planner fails: each tick it picks the cheapest path on a
 discrete grid, and `plan_center_weight` 20 pulls it strongly to the centre.
@@ -313,13 +319,44 @@ Caveats:
   A classical planner with a longer horizon, able to use the 8 m vision
   range, has not been compared yet.
 
-Training saturated after ~300k steps (7–13/200 multi-obstacle failures for
-every checkpoint up to 700k). The released model is the 200k checkpoint,
-which had the fewest failures.
+The released model is the 150k checkpoint: the first one with no layout
+that the classical planner passes and SAC fails.
 
-`test_frenet_rl.py --set hard` replays some of these layouts. It includes
-the 3 remaining SAC failures and 2 layouts where only the classical planner
-fails.
+**Representative scenarios** (`test_frenet_rl.py --set report --video DIR`).
+In the test script both planners pick `Ti` from the same range, 2.0–3.0 s:
+the classical planner samples 2.0, 2.2, …, 3.0 s (`np.arange` on the car
+stops at 2.8 s), and the policy picks any value in between. The panel shows
+5 m ahead. `--video DIR` saves an H.264 side-by-side video per scenario
+(`<name>_compare.mp4`).
+
+| # | Scenario | Shows | SAC | Min dist (m) | Mean \|d\| (m) | Classical | Min dist (m) | Mean \|d\| (m) |
+|---|---|---|---|---|---|---|---|---|
+| 1 | no_obstacle | Lane keeping, empty road | pass | — | 0.000 | pass | — | 0.000 |
+| 2 | heading_offset_left | Recovery from a 20° heading error | pass | — | 0.009 | pass | — | 0.013 |
+| 3 | obstacle_left0.5 | One off-centre obstacle | pass | 1.13 | 0.052 | pass | 0.81 | 0.023 |
+| 4 | obstacle_center | One centred obstacle | pass | 1.01 | 0.102 | **no path** | 1.02 | 0.000 |
+| 5 | zigzag trái→phải | Two staggered obstacles, 10 m apart | pass | 1.13 | 0.106 | pass | 0.81 | 0.045 |
+| 6 | zigzag sát (4 m) | Two staggered obstacles, 4 m apart | pass | 1.02 | 0.190 | pass | 0.81 | 0.041 |
+| 7 | giữa + chặn trái | Centred obstacle, left side blocked | pass | 1.19 | 0.164 | **no path** | 1.10 | 0.001 |
+| 8 | gen_ep10_Frenet_fail | Generated cluster, only SAC passes | pass | 0.98 | 0.159 | **no path** | 1.11 | 0.009 |
+| 9 | gen_ep39_both_ok | Generated cluster, both pass | pass | 1.04 | 0.418 | pass | 0.82 | 0.055 |
+| 10 | gen_ep187_both_fail | Limitation: both fail | **no path** | 0.99 | 0.350 | **no path** | 0.77 | 0.036 |
+
+SAC fails 1/10 and the classical planner 4/10. There are no collisions:
+every failure is "no feasible path". SAC swerves wider (higher mean |d|) and
+keeps more distance from obstacles (1.0–1.2 m vs 0.81 m). On all 26
+scenarios (`--set all`) SAC fails 2/26 and the classical planner 7/26.
+
+Fairness checks:
+- **Path length.** With `--horizon 3.0` both planners use the same fixed
+  `Ti`, so their paths have the same length (2.8 m). The results do not
+  change (2/26 vs 7/26). Adding `Ti` = 3.0 s to the classical grid does not
+  change them either. The classical failures are not caused by shorter paths.
+- **Obstacle information.** Both planners receive the same obstacles
+  (everything within 8 m). The classical cost only penalises obstacles near
+  its 2–3 m path, while the SAC gate checks the straight path up to 8 m. Part
+  of SAC's earlier reaction comes from this hand-written gate, not from
+  learning.
 
 ## Known limitations
 

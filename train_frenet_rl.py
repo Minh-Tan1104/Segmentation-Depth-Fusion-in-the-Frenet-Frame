@@ -154,6 +154,7 @@ RL_META = RLPolicyMeta(
     # nhất thì né vào vật thứ hai.
     obs_version=3,
     max_obstacles=3,
+    action_power=2.0,
 )
 assert RL_META.center_offset == 0.0, "khung gương lật action quanh tâm làn"
 
@@ -695,6 +696,7 @@ def render_frenet_panel(
     renderer: OverlayRenderer,
     path_builder_env: "FrenetStraightEnv",
     title: str,
+    view_m: float | None = None,
 ) -> np.ndarray | None:
     """Dựng canvas panel Frenet (draw_frenet_panel, visualization/logic.py)
     từ info CỦA 1 STEP mô phỏng (bất kể nguồn: rollout training thật,
@@ -740,7 +742,12 @@ def render_frenet_panel(
 
     frenet = {
         "kappa_ff": 0.0,
-        "s_max_m": max(max(info["path_s"], default=0.5) * 1.15, 0.5),
+        # Cố định tầm dọc = tầm nhìn vật cản + 1 m: path robot chỉ dài 2-3 m,
+        # nếu co theo path thì vật cản (thấy từ 8 m) chỉ hiện khi đã rất gần,
+        # và 2 panel (SAC/Frenet) khác thang.
+        # view_m: tầm dọc cố định do caller chọn (vd video báo cáo).
+        "s_max_m": view_m if view_m is not None else max(
+            max(info["path_s"], default=0.5) * 1.15, ENV_CONFIG["vision_range_m"] + 1.0),
         "candidate_paths": candidate_paths,
         "optimal_path": optimal_path,
         # target_s từ compute_cmd_vel đã tính với s_now=0.0 (env.step gọi

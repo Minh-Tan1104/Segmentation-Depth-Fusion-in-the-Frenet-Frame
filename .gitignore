@@ -23,5 +23,7 @@ models/*
 !models/*.zip
 !models/*.meta.json
 plots/
+videos/
 tb_logs/
 .venv/
+videos_report/

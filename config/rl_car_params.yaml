@@ -116,7 +116,7 @@ control_node:
     # Đường dẫn TUYỆT ĐỐI tới model .zip (hỗ trợ ~); cần file <tên>.meta.json cạnh nó
     # (train_frenet_rl.py tự ghi). models/ không được colcon cài vào install/.
     # Train với chính tham số robot trong file này (xem README). Model cũ vẫn dùng được.
-    plan_rl_model_path: "~/ros2_ws/src/RL_CAR/models/sac_frenet_straight_multi_s1_200k.zip"
+    plan_rl_model_path: "~/ros2_ws/src/RL_CAR/models/sac_frenet_straight_parity_s1_150k.zip"
     # --- GPS assist (Gps/route_ekf.py) — CHỈ dùng d/psi_err từ GPS khi mất
     # vision quá lâu VÀ GPS đủ tin cậy; mặc định TẮT (an toàn), xem
     # control/node.py _planner_tick cho logic chuyển nguồn. GPS không bao

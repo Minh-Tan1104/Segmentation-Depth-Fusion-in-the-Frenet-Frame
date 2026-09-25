@@ -12,14 +12,19 @@ sim_predict như env train.
 - Frenet: FrenetOptimalPlanner.plan() nguyên vẹn.
 Thất bại = hết đường khả thi (planner trả None) hoặc xe cách vật <= robot_radius.
 
-    python3 test_frenet_rl.py [model] [--set single|multi|hard|all]
+    python3 test_frenet_rl.py [model] [--set single|multi|hard|all] [--video DIR]
+
+--video DIR: quay video từng kịch bản (DIR/<kịch bản>_SAC.mp4, _Frenet.mp4 và
+_compare.mp4 ghép song song SAC | Frenet), H.264 nếu có ffmpeg. Tốc độ phát
+= VIDEO_SPEED lần thời gian thực. Chạy được không cần màn hình.
 
 Nhóm kịch bản (--set, mặc định multi):
   single — 1 vật quét ngang làn + đường trống + lệch heading ±20°
   multi  — 2-3 vật dựng tay (zigzag, cổng, cùng phía, …)
   hard   — kịch bản sinh ngẫu nhiên (sample_obstacle_layout, luôn khả thi),
-           nhiều vật, lấy từ đánh giá 200 ca của model 200k: 3 ca SAC còn thất
-           bại, 2 ca chỉ Frenet hết đường, 2 ca cả hai qua
+           nhiều vật, lấy từ đánh giá 200 ca (model parity 150k): khe giữa 2
+           vật (trước đây RL hỏng, Frenet qua), chỉ Frenet hết đường, cả hai
+           qua, cả hai hết đường
 """
 
 from __future__ import annotations
@@ -49,9 +54,20 @@ from train_frenet_rl import (
     FrenetStraightEnv,
     render_frenet_panel,
     sim_predict,
+    PANEL_W,
+    PANEL_H,
 )
 
-MODEL_PATH = os.path.join(MODELS_DIR, "sac_frenet_straight_multi_s1_200k")
+MODEL_PATH = os.path.join(MODELS_DIR, "sac_frenet_straight_parity_s1_150k")
+
+# Frenet lấy mẫu Ti = np.arange(min_t, max_t, dt) nên bỏ mất max_t (3.0 s);
+# RL chọn Ti liên tục trong [min_t, max_t]. +dt/2 để Frenet có đủ 2.0..3.0 s
+# như RL — cùng miền Ti cho 2 phương pháp.
+import dataclasses
+TEST_PLANNER_CFG = dataclasses.replace(PLANNER_CFG, max_t=PLANNER_CFG.max_t + PLANNER_CFG.dt / 2)
+
+# Tầm dọc panel [m] khi vẽ/quay video (path robot dài 2-3 m).
+PANEL_VIEW_M = 5.0
 
 # Kịch bản: (tên, [(s tuyệt đối, d), ...], d0, psi0). +d = phải, -d = trái.
 S_OBS = ENV_CONFIG["course_length_m"] / 2.0
@@ -74,12 +90,21 @@ def _generated(seed: int, name: str):
 
 
 def _hard():
-    return [_generated(50_000 + ep, f"gen_ep{ep}_RL_fail") for ep in (51, 157, 178)] + \
-           [_generated(50_000 + ep, f"gen_ep{ep}_Frenet_fail") for ep in (10, 14)] + \
-           [_generated(50_000 + ep, f"gen_ep{ep}_both_ok") for ep in (39, 103)]
+    groups = (("khe_giua", (157, 178)), ("Frenet_fail", (10, 14)),
+              ("both_ok", (39, 103)), ("both_fail", (13, 187)))
+    return [_generated(50_000 + ep, f"gen_ep{ep}_{tag}") for tag, eps in groups for ep in eps]
+
+
+# Kịch bản tiêu biểu cho bảng tổng kết báo cáo (--set report).
+_REPORT = ("no_obstacle", "heading_offset_left", "obstacle_left0.5", "obstacle_center",
+           "zigzag trái→phải", "zigzag sát (4 m)", "giữa + chặn trái",
+           "gen_ep10_Frenet_fail", "gen_ep39_both_ok", "gen_ep187_both_fail")
 
 
 def scenario_set(name: str):
+    if name == "report":
+        by_name = {sc[0]: sc for sc in _SINGLE + _MULTI + _hard()}
+        return [by_name[n] for n in _REPORT]
     if name == "single":
         return _SINGLE
     if name == "multi":
@@ -103,6 +128,10 @@ RENDER_HZ = 10.0
 # hơn hẳn bản cũ (vốn chỉ 1 khung/tick, nhảy cách quãng) mà xem hết trong
 # vài phút. Đổi về 1.0 nếu muốn đúng thời gian thực.
 PLAYBACK_SPEED = 4.0
+
+# Video (--video): 1 khung mỗi 1/RENDER_HZ s mô phỏng, phát ở VIDEO_SPEED lần
+# thời gian thực.
+VIDEO_SPEED = 2.0
 
 
 def _animate_substeps(live: "LivePanel", info: dict, title: str) -> None:
@@ -145,10 +174,24 @@ class LivePanel:
                 pass  # backend không hỗ trợ đặt tên cửa sổ — bỏ qua, không quan trọng
             self.fig.show()
 
+    video = None  # cv2.VideoWriter khi đang quay (start_video/stop_video)
+
+    def start_video(self, path: str) -> None:
+        self.video = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                     RENDER_HZ * VIDEO_SPEED, (PANEL_W, PANEL_H))
+
+    def stop_video(self) -> None:
+        if self.video is not None:
+            self.video.release()
+            self.video = None
+
     def update(self, info: dict, title: str, pause: float = 1.0 / RENDER_HZ) -> None:
-        canvas = render_frenet_panel(info, self.renderer, self.path_builder_env, title=title)
+        canvas = render_frenet_panel(info, self.renderer, self.path_builder_env, title=title,
+                                     view_m=PANEL_VIEW_M)
         if canvas is None:
             return
+        if self.video is not None:
+            self.video.write(canvas)
         cv2.imwrite(os.path.join(PLOTS_DIR, f"test_live_{self.name}.png"), canvas)
         if not INTERACTIVE_PLOTS:
             return
@@ -244,19 +287,76 @@ class _CountingRLPlanner(RLPlanner):
             self.planner.plan = counted
 
 
-def _run_method_process(method: str, model_path: str, set_name: str, result_queue) -> None:
+def _run_method_process(method: str, model_path: str, set_name: str, result_queue,
+                        video_dir: str | None = None, horizon_s: float | None = None) -> None:
     """Chạy trong PROCESS CON RIÊNG (spawn) — cửa sổ live của riêng process
     này, chạy tuần tự qua toàn bộ kịch bản cho ĐÚNG 1 phương pháp, gửi kết quả
     về process cha qua Queue. 2 process chạy thật song song."""
     live = LivePanel(name=method)
-    planner = _CountingRLPlanner(model_path) if method == "SAC" else FrenetPlanner()
+    planner = (_CountingRLPlanner(model_path, planner_cfg=TEST_PLANNER_CFG, horizon_s=horizon_s)
+               if method == "SAC" else FrenetPlanner(planner_cfg=TEST_PLANNER_CFG, horizon_s=horizon_s))
     results = []
     for name, obstacles, d0, psi0 in scenario_set(set_name):
+        if video_dir:
+            live.start_video(os.path.join(video_dir, f"{name}_{method}.raw.mp4"))
         results.append((name, run_scenario(planner, obstacles, d0, psi0, live, title=f"{name} ({method})")))
+        live.stop_video()
     result_queue.put(results)
     if INTERACTIVE_PLOTS:
         # Gửi kết quả về cha XONG mới block chờ đóng cửa sổ.
         plt.show(block=True)
+
+
+def _h264(src: str, dst: str) -> None:
+    """mp4v (OpenCV) -> H.264 (mở được trong PowerPoint/Word/trình duyệt);
+    không có ffmpeg thì giữ nguyên file mp4v."""
+    import shutil
+    import subprocess
+    if shutil.which("ffmpeg") and subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-c:v", "libx264",
+             "-pix_fmt", "yuv420p", dst]).returncode == 0:
+        os.remove(src)
+    else:
+        os.replace(src, dst)
+
+
+def _make_videos(video_dir: str, name: str, sac: dict, cost: dict) -> None:
+    """Chuyển 2 video từng phương pháp sang H.264 và ghép song song
+    SAC | Frenet (video ngắn hơn giữ khung cuối), thêm dải tiêu đề kết quả."""
+    raws = {m: os.path.join(video_dir, f"{name}_{m}.raw.mp4") for m in ("SAC", "Frenet")}
+    frames = {}
+    for m, path in raws.items():
+        cap, fs = cv2.VideoCapture(path), []
+        while True:
+            ok, f = cap.read()
+            if not ok:
+                break
+            fs.append(f)
+        cap.release()
+        frames[m] = fs or [np.full((PANEL_H, PANEL_W, 3), 255, np.uint8)]
+    n = max(len(fs) for fs in frames.values())
+    header_h = 34
+    raw_cmp = os.path.join(video_dir, f"{name}_compare.raw.mp4")
+    out = cv2.VideoWriter(raw_cmp, cv2.VideoWriter_fourcc(*"mp4v"), RENDER_HZ * VIDEO_SPEED,
+                          (2 * PANEL_W, PANEL_H + header_h))
+
+    def verdict(r):
+        if not r["failed"]:
+            return f"QUA (cach vat {r['min_dist']:.2f} m)" if math.isfinite(r["min_dist"]) else "QUA"
+        return "HET DUONG" if r["stuck"] else "VA CHAM"
+
+    for i in range(n):
+        row = np.hstack([frames["SAC"][min(i, len(frames["SAC"]) - 1)],
+                         frames["Frenet"][min(i, len(frames["Frenet"]) - 1)]])
+        head = np.full((header_h, 2 * PANEL_W, 3), 255, np.uint8)
+        for x0, tag, r in ((0, "SAC (RL)", sac), (PANEL_W, "Frenet", cost)):
+            cv2.putText(head, f"{tag}: {verdict(r)}", (x0 + 8, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0, 120, 0) if not r["failed"] else (0, 0, 200), 1, cv2.LINE_AA)
+        out.write(np.vstack([head, row]))
+    out.release()
+    for m, path in raws.items():
+        _h264(path, os.path.join(video_dir, f"{name}_{m}.mp4"))
+    _h264(raw_cmp, os.path.join(video_dir, f"{name}_compare.mp4"))
 
 
 def _plot_scenario(name: str, obstacles, sac, cost) -> None:
@@ -282,19 +382,25 @@ def _plot_scenario(name: str, obstacles, sac, cost) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("model", nargs="?", default=MODEL_PATH)
-    ap.add_argument("--set", default="multi", choices=("single", "multi", "hard", "all"))
+    ap.add_argument("--set", default="multi", choices=("single", "multi", "hard", "all", "report"))
+    ap.add_argument("--video", default=None, metavar="DIR", help="quay video từng kịch bản vào DIR")
+    ap.add_argument("--horizon", type=float, default=None, metavar="T",
+                    help="ép cả SAC và Frenet dùng cùng Ti=T [s] (cùng độ dài path)")
     args = ap.parse_args()
     os.makedirs(PLOTS_DIR, exist_ok=True)
+    if args.video:
+        os.makedirs(args.video, exist_ok=True)
     scenarios = scenario_set(args.set)
-    print(f"[RUN] model: {args.model} | nhóm kịch bản: {args.set} ({len(scenarios)})", flush=True)
+    print(f"[RUN] model: {args.model} | nhóm kịch bản: {args.set} ({len(scenarios)})"
+          f" | horizon: {args.horizon if args.horizon else 'theo planner'}", flush=True)
 
     # 2 process OS riêng (spawn — an toàn với Tk/matplotlib), mỗi process 1
     # phương pháp, cửa sổ live riêng, chạy song song.
     ctx = mp.get_context("spawn")
     q_sac: "mp.Queue" = ctx.Queue()
     q_cost: "mp.Queue" = ctx.Queue()
-    p_sac = ctx.Process(target=_run_method_process, args=("SAC", args.model, args.set, q_sac))
-    p_cost = ctx.Process(target=_run_method_process, args=("Frenet", args.model, args.set, q_cost))
+    p_sac = ctx.Process(target=_run_method_process, args=("SAC", args.model, args.set, q_sac, args.video, args.horizon))
+    p_cost = ctx.Process(target=_run_method_process, args=("Frenet", args.model, args.set, q_cost, args.video, args.horizon))
     p_sac.start()
     p_cost.start()
     sac_by_name = dict(q_sac.get())
@@ -308,6 +414,8 @@ def main() -> None:
     for name, obstacles, _d0, _psi0 in scenarios:
         sac, cost = sac_by_name[name], cost_by_name[name]
         _plot_scenario(name, obstacles, sac, cost)
+        if args.video:
+            _make_videos(args.video, name, sac, cost)
         for tag, r in (("SAC", sac), ("Frenet", cost)):
             totals[tag] += r["failed"]
             md = f"{r['min_dist']:.2f}" if math.isfinite(r["min_dist"]) else "—"
@@ -317,6 +425,8 @@ def main() -> None:
     for tag, n in totals.items():
         print(f"\n{tag}: thất bại {n}/{len(scenarios)} kịch bản")
     print(f"\nPlots lưu trong {PLOTS_DIR}/test_<scenario>.png")
+    if args.video:
+        print(f"Video lưu trong {args.video}/<kịch bản>_{{SAC,Frenet,compare}}.mp4")
     if INTERACTIVE_PLOTS:
         print("Xem xong — đóng cả 2 cửa sổ panel để 2 process kết thúc.")
     p_sac.join()

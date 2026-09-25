@@ -33,7 +33,7 @@ import numpy as np
 from control.ekf import FrenetEKF
 from control.pure_pursuit import compute_cmd_vel
 from planner_motion.frenet_planner import FrenetOptimalPlanner
-from planner_motion.rl_policy import RLPolicy, lane_keeping_is_clear
+from planner_motion.rl_policy import RLPolicy, gate_distance, lane_keeping_is_clear
 from train_frenet_rl import ENV_CONFIG, PLANNER_CFG, PP_CFG, MODELS_DIR, sim_predict
 
 import os
@@ -61,9 +61,21 @@ INIT_D_M = 0.1       # |d0| <= 0.1 m
 INIT_PSI_DEG = 3.0   # |psi0| <= 3°
 
 
+def fixed_horizon_cfg(planner_cfg, horizon_s):
+    """Config chỉ lấy mẫu đúng 1 Ti = horizon_s (np.arange bỏ max_t nên +dt/2)."""
+    import dataclasses
+    return dataclasses.replace(planner_cfg, min_t=horizon_s, max_t=horizon_s + planner_cfg.dt / 2)
+
+
 class RLPlanner:
-    def __init__(self, model_path: str, planner_cfg=PLANNER_CFG):
+    """horizon_s: ép Ti cố định (bỏ qua action[1]) — cùng độ dài path với
+    FrenetPlanner(horizon_s=...) để so sánh công bằng. None = Ti theo policy."""
+
+    def __init__(self, model_path: str, planner_cfg=PLANNER_CFG, horizon_s=None):
         self.policy = RLPolicy(model_path)
+        self.horizon_s = horizon_s
+        if horizon_s is not None:
+            planner_cfg = fixed_horizon_cfg(planner_cfg, horizon_s)
         self.planner = FrenetOptimalPlanner(planner_cfg)
 
     def reset(self):
@@ -72,6 +84,8 @@ class RLPlanner:
     def _build(self, d, c_d_d, v, action, obstacles):
         from planner_motion.rl_policy import decode_action
         d_target, Ti = decode_action(action, self.policy.meta)
+        if self.horizon_s is not None:
+            Ti = self.horizon_s
         fp = self.planner.build_path(0.0, v, d, c_d_d, 0.0, d_target, Ti, v)
         ok = self.planner._check_paths(self.planner._calc_global_paths([fp]), obstacles)
         return ok[0] if ok else None
@@ -82,7 +96,8 @@ class RLPlanner:
         if obstacles:
             fp = self._build(d, c_d_d, v, self.policy.action(d, psi, [], latch=False), obstacles)
             if fp is not None and lane_keeping_is_clear(
-                    fp.s, fp.d, obstacles, self.planner.config.clearance, self.policy.meta.vision_range_m):
+                    fp.s, fp.d, obstacles, gate_distance(self.planner.config.robot_radius),
+                    self.policy.meta.vision_range_m):
                 return fp
         fp = self._build(d, c_d_d, v, self.policy.action(d, psi, obstacles), obstacles)
         if fp is None:
@@ -91,7 +106,9 @@ class RLPlanner:
 
 
 class FrenetPlanner:
-    def __init__(self, planner_cfg=PLANNER_CFG):
+    def __init__(self, planner_cfg=PLANNER_CFG, horizon_s=None):
+        if horizon_s is not None:
+            planner_cfg = fixed_horizon_cfg(planner_cfg, horizon_s)
         self.planner = FrenetOptimalPlanner(planner_cfg)
 
     def reset(self):
@@ -163,7 +180,7 @@ def fmt_row(name, label, r, runs, has_obs):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("model", nargs="?", default=os.path.join(MODELS_DIR, "sac_frenet_straight_multi_s1_200k"))
+    ap.add_argument("model", nargs="?", default=os.path.join(MODELS_DIR, "sac_frenet_straight_parity_s1_150k"))
     ap.add_argument("--runs", type=int, default=20)
     ap.add_argument("--rate", type=float, default=ENV_CONFIG["pp_rate_hz"],
                     help="tần số pure pursuit + lập đường [Hz]")

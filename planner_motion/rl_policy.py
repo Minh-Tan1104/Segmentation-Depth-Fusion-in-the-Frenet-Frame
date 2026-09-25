@@ -41,6 +41,11 @@ class RLPolicyMeta:
     # trái-hoặc-thẳng xe trong input, action lật lại khi xuất. Meta cũ -> False.
     canonical: bool = False
     side_switch_m: float = 0.3
+    # d_target = center + d_max * sign(a)*|a|^action_power. 1 = tuyến tính
+    # (model cũ). 2: gần tâm mịn hơn — sai số 0.025 của mạng chỉ còn ~1.5 mm
+    # thay vì 6 cm (đo: model tuyến tính đứng lệch +0.06 m khi đường trống vì
+    # chi phí 6 cm quá nhỏ so với nhiễu critic), vẫn tới được ±d_max.
+    action_power: float = 1.0
 
     def save(self, path: str) -> None:
         with open(path, "w") as f:
@@ -104,12 +109,24 @@ def build_observation(
     return np.clip(obs, -high, high)
 
 
+# Gate cho đi thẳng nếu đường bám làn cách mọi vật >= robot_radius + margin
+# (không phải plan_clearance): Frenet cũng đi qua khe giữa 2 vật khi cách ~1 m
+# (chỉ bị phạt mềm), còn gate 1.2 m đẩy các khe đó sang policy và policy né
+# quá tay vào vật phía sau (đo: 2/93 kịch bản Frenet qua mà RL không qua ->
+# 0/93 với margin 0.3 m). Cùng biên với ràng buộc khả thi R4 lúc train.
+GATE_MARGIN_M = 0.3
+
+
+def gate_distance(robot_radius: float) -> float:
+    return robot_radius + GATE_MARGIN_M
+
+
 def lane_keeping_is_clear(path_s: np.ndarray, path_d: np.ndarray,
-                          obstacles: list[tuple[float, float]], clearance: float,
+                          obstacles: list[tuple[float, float]], min_dist: float,
                           horizon_m: float) -> bool:
     """Gate "chỉ đưa vật cản cho policy khi cần": đường bám làn (path_s,
     path_d; s tương đối xe) KÉO DÀI tới horizon_m, giữ nguyên d cuối, có
-    cách mọi vật cản (ds, d) ít nhất clearance không.
+    cách mọi vật cản (ds, d) ít nhất min_dist (xem gate_distance) không.
 
     Kéo dài vì path chỉ dài Ti*v (robot: 2-3 m) trong khi vật cản thấy tới
     tầm nhìn (8 m): so với path ngắn, vật ở ds 3-6 m luôn "đủ xa" -> gate cho
@@ -117,17 +134,19 @@ def lane_keeping_is_clear(path_s: np.ndarray, path_d: np.ndarray,
     s_ext = np.append(path_s, max(horizon_m, float(path_s[-1])))
     d_ext = np.append(path_d, path_d[-1])
     for ds, d_obs in obstacles:
-        if abs(d_obs - float(np.interp(ds, s_ext, d_ext))) < clearance:
+        if abs(d_obs - float(np.interp(ds, s_ext, d_ext))) < min_dist:
             return False
-        if float(np.min(np.hypot(path_s - ds, path_d - d_obs))) < clearance:
+        if float(np.min(np.hypot(path_s - ds, path_d - d_obs))) < min_dist:
             return False
     return True
 
 
 def decode_action(action: np.ndarray, meta: RLPolicyMeta) -> tuple[float, float]:
     """action∈[-1,1]^2 -> (d_target TUYỆT ĐỐI, Ti)."""
+    a0 = float(action[0])
+    shaped = math.copysign(abs(a0) ** meta.action_power, a0)
     d_target = float(
-        np.clip(meta.center_offset + float(action[0]) * meta.d_max, meta.d_min, meta.d_max)
+        np.clip(meta.center_offset + shaped * meta.d_max, meta.d_min, meta.d_max)
     )
     Ti = meta.min_t + (float(action[1]) + 1.0) / 2.0 * (meta.max_t - meta.min_t)
     return d_target, max(Ti, 1e-2)

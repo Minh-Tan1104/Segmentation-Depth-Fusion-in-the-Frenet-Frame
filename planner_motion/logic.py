@@ -206,10 +206,11 @@ class PlannerLogic:
 
         Chỉ đưa obstacle cho policy khi CẦN: trước hết hỏi policy như không có
         obstacle (bám làn); nếu path đó khả thi và — kéo dài tới hết tầm nhìn
-        (lane_keeping_is_clear) — cách mọi obstacle >= clearance thì dùng luôn.
+        (lane_keeping_is_clear) — cách mọi obstacle >= robot_radius + 0.3 m
+        (gate_distance) thì dùng luôn.
         Policy tự nó né cả obstacle lệch xa mà đi thẳng vẫn an toàn (đo sim,
         model old: d_obs ±1.4..2.0 m vẫn lệch 0.4-0.65 m, cost-based giữ 0)."""
-        from .rl_policy import lane_keeping_is_clear
+        from .rl_policy import gate_distance, lane_keeping_is_clear
 
         speed = self.target_speed
         psi = math.asin(max(-1.0, min(1.0, c_d_d / speed))) if speed > 0.0 else 0.0
@@ -225,7 +226,7 @@ class PlannerLogic:
         if obstacles:
             fp = build([], latch=False)
             if fp is not None and lane_keeping_is_clear(
-                fp.s, fp.d, obstacles, self.planner.config.clearance,
+                fp.s, fp.d, obstacles, gate_distance(self.planner.config.robot_radius),
                 self.rl_policy.meta.vision_range_m,
             ):
                 return fp
