@@ -32,8 +32,11 @@ class RLPolicyMeta:
     # 1: obs 4 chiều [d, psi, ds, d_obs] — "không obstacle" mã hoá (ds=tầm
     #    nhìn, d_obs=0), TRÙNG với obstacle giữa làn vừa vào tầm nhìn.
     # 2: thêm cờ has_obstacle (obs 5 chiều) để tách 2 trường hợp đó.
+    # 3: tối đa max_obstacles vật gần nhất, mỗi vật (ds, d_obs, present):
+    #    [d, psi] + max_obstacles*3 — cần khi 2-3 vật cùng trong tầm nhìn.
     # Meta cũ không có field -> 1, model cũ vẫn chạy đúng.
     obs_version: int = 1
+    max_obstacles: int = 1
     # True: policy train trong KHUNG GƯƠNG (SideLatch) — vật cản luôn ở phía
     # trái-hoặc-thẳng xe trong input, action lật lại khi xuất. Meta cũ -> False.
     canonical: bool = False
@@ -55,37 +58,70 @@ def meta_path(model_path: str) -> str:
 
 
 def obs_high(meta: RLPolicyMeta) -> np.ndarray:
+    if meta.obs_version >= 3:
+        high = [meta.d_max * 1.25, math.pi] + [meta.d_max * 1.1, meta.d_max * 1.1, 1.0] * meta.max_obstacles
+        return np.array(high, dtype=np.float32)
     high = [meta.d_max * 1.25, math.pi, meta.d_max * 1.1, meta.d_max * 1.1]
     if meta.obs_version >= 2:
         high.append(1.0)
     return np.array(high, dtype=np.float32)
 
 
-def nearest_obstacle_ahead(
-    obstacles: list[tuple[float, float]], vision_range_m: float
-) -> tuple[float, float] | None:
-    """(ds, d) của obstacle gần nhất PHÍA TRƯỚC trong tầm nhìn, None nếu không
-    có. obstacles: (ds, d) — ds tương đối vị trí xe (s0=0), d theo khung làn."""
-    best = None
-    for ds, d in obstacles:
-        if 0.0 <= ds <= vision_range_m and (best is None or ds < best[0]):
-            best = (ds, d)
-    return best
+def obstacles_ahead(
+    obstacles: list[tuple[float, float]], vision_range_m: float, k: int
+) -> list[tuple[float, float]]:
+    """k vật cản (ds, d) gần nhất PHÍA TRƯỚC trong tầm nhìn, gần nhất trước."""
+    ahead = sorted(o for o in obstacles if 0.0 <= o[0] <= vision_range_m)
+    return ahead[:k]
 
 
 def build_observation(
-    d: float, psi: float, obstacle: tuple[float, float] | None, meta: RLPolicyMeta
+    d: float, psi: float, obstacles: list[tuple[float, float]], meta: RLPolicyMeta
 ) -> np.ndarray:
-    """[d, psi, ds_obs scale về ~[0, d_max], d_obs(, has_obstacle nếu
-    obs_version>=2)]; không có obstacle trong tầm nhìn -> (ds=vision_range_m,
-    d_obs=0, has_obstacle=0), đúng mặc định lúc train."""
+    """obstacles: vật cản trong tầm nhìn (ds, d), GẦN NHẤT TRƯỚC (xem
+    obstacles_ahead). obs_version 1/2: chỉ dùng vật đầu — [d, psi, ds scale
+    về ~[0, d_max], d_obs(, has_obstacle)]. obs_version 3: [d, psi] + mỗi
+    slot (ds, d_obs, present) cho max_obstacles vật. Slot trống / không có
+    vật: (ds=vision_range_m, d_obs=0, present=0), đúng mặc định lúc train."""
+    scale = meta.d_max / meta.vision_range_m
+    if meta.obs_version >= 3:
+        feats = [d, psi]
+        for i in range(meta.max_obstacles):
+            if i < len(obstacles):
+                feats += [obstacles[i][0] * scale, obstacles[i][1], 1.0]
+            else:
+                feats += [meta.d_max, 0.0, 0.0]
+        obs = np.array(feats, dtype=np.float32)
+        high = obs_high(meta)
+        return np.clip(obs, -high, high)
+    obstacle = obstacles[0] if obstacles else None
     ds_obs, d_obs = obstacle if obstacle is not None else (meta.vision_range_m, 0.0)
-    feats = [d, psi, ds_obs / meta.vision_range_m * meta.d_max, d_obs]
+    feats = [d, psi, ds_obs * scale, d_obs]
     if meta.obs_version >= 2:
         feats.append(0.0 if obstacle is None else 1.0)
     obs = np.array(feats, dtype=np.float32)
     high = obs_high(meta)
     return np.clip(obs, -high, high)
+
+
+def lane_keeping_is_clear(path_s: np.ndarray, path_d: np.ndarray,
+                          obstacles: list[tuple[float, float]], clearance: float,
+                          horizon_m: float) -> bool:
+    """Gate "chỉ đưa vật cản cho policy khi cần": đường bám làn (path_s,
+    path_d; s tương đối xe) KÉO DÀI tới horizon_m, giữ nguyên d cuối, có
+    cách mọi vật cản (ds, d) ít nhất clearance không.
+
+    Kéo dài vì path chỉ dài Ti*v (robot: 2-3 m) trong khi vật cản thấy tới
+    tầm nhìn (8 m): so với path ngắn, vật ở ds 3-6 m luôn "đủ xa" -> gate cho
+    đi thẳng tới khi quá muộn để né (đo: 9/20 thất bại cụm vật cản do đây)."""
+    s_ext = np.append(path_s, max(horizon_m, float(path_s[-1])))
+    d_ext = np.append(path_d, path_d[-1])
+    for ds, d_obs in obstacles:
+        if abs(d_obs - float(np.interp(ds, s_ext, d_ext))) < clearance:
+            return False
+        if float(np.min(np.hypot(path_s - ds, path_d - d_obs))) < clearance:
+            return False
+    return True
 
 
 def decode_action(action: np.ndarray, meta: RLPolicyMeta) -> tuple[float, float]:
@@ -139,11 +175,11 @@ class SideLatch:
 
 
 def canonical_observation(
-    d: float, psi: float, obstacle: tuple[float, float] | None, side: int, meta: RLPolicyMeta
+    d: float, psi: float, obstacles: list[tuple[float, float]], side: int, meta: RLPolicyMeta
 ) -> np.ndarray:
-    if obstacle is not None:
-        obstacle = (obstacle[0], side * obstacle[1])
-    return build_observation(side * d, side * psi, obstacle, meta)
+    """Lật gương d, psi và d_obs của MỌI vật theo side (chốt theo vật gần nhất)."""
+    mirrored = [(ds, side * d_obs) for ds, d_obs in obstacles]
+    return build_observation(side * d, side * psi, mirrored, meta)
 
 
 class RLPolicy:
@@ -160,15 +196,16 @@ class RLPolicy:
     ) -> np.ndarray:
         """Action thô ∈[-1,1]^2 ở khung THẬT. latch=False: truy vấn phụ (vd
         hỏi "nếu không có vật cản"), không đụng trạng thái SideLatch."""
-        obstacle = nearest_obstacle_ahead(obstacles, self.meta.vision_range_m)
+        visible = obstacles_ahead(obstacles, self.meta.vision_range_m, self.meta.max_obstacles)
+        nearest = visible[0] if visible else None
         if not self.meta.canonical:
-            obs = build_observation(d, psi, obstacle, self.meta)
+            obs = build_observation(d, psi, visible, self.meta)
             return self.model.predict(obs, deterministic=True)[0]
         if latch:
-            side = self.latch.update(d, obstacle)
+            side = self.latch.update(d, nearest)
         else:
-            side = 1 if obstacle is None else (self.latch.side or 1)
-        obs = canonical_observation(d, psi, obstacle, side, self.meta)
+            side = 1 if nearest is None else (self.latch.side or 1)
+        obs = canonical_observation(d, psi, visible, side, self.meta)
         action = self.model.predict(obs, deterministic=True)[0].copy()
         action[0] *= side  # center_offset=0 (assert lúc train) -> lật quanh tâm làn
         return action

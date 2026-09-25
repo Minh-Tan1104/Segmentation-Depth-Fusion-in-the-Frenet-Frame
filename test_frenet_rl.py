@@ -1,38 +1,40 @@
-"""Test SAC agent (đã train bằng train_frenet_rl.py) trên 4 kịch bản cố định
-và so sánh với cost-based Frenet planner gốc (planner_motion/frenet_planner.py,
-gọi lại đúng FrenetOptimalPlanner.plan() — không viết lại cost).
+"""Xem trực quan SAC (RL) và Frenet cost-based trên các kịch bản cố định —
+mỗi phương pháp 1 cửa sổ panel chạy song song, cuối cùng in bảng + lưu plot
+quỹ đạo từng kịch bản để tự đánh giá.
 
-Mô phỏng giống env train (train_frenet_rl.py): tham số planner/pure pursuit
-của robot, mỗi step 0.5 s gồm các tick pure pursuit 40 Hz và đường được lập
-lại mỗi tick. Animation phát lại pose thật của từng tick (info["trace"]).
+Cả 2 chạy CÙNG vòng mô phỏng giống robot (tham số trong
+config/rl_car_params.yaml): pure pursuit 40 Hz, đường lập lại MỖI tick,
+sim_predict như env train.
+- SAC: đúng logic PlannerLogic._plan_rl trên xe (compare_rl_frenet.RLPlanner):
+  gate "chỉ đưa vật cản cho policy khi cần" + RLPolicy (khung gương, chốt
+  phía, tối đa 3 vật) + kiểm tra cứng; đường RL bị loại -> tick đó dùng Frenet
+  (đếm ở cột "Frenet thay").
+- Frenet: FrenetOptimalPlanner.plan() nguyên vẹn.
+Thất bại = hết đường khả thi (planner trả None) hoặc xe cách vật <= robot_radius.
 
-Khi so sánh: dùng FrenetStraightEnv(discretize_d_for_eval=True) để round
-d_target liên tục của SAC về lưới rời rạc (center_offset + k*d_road_w) mà
-cost-based planner đang dùng — so sánh công bằng (xem train_frenet_rl.py:
-_round_to_grid).
+    python3 test_frenet_rl.py [model] [--set single|multi|hard|all]
 
-SAC chạy qua ĐÚNG đường của robot: RLPolicy (planner_motion/rl_policy.py —
-đọc meta cạnh model, tự áp khung gương + chốt phía nếu model train theo
-kiểu đó) + gate "chỉ đưa vật cản cho policy khi đi thẳng không an toàn"
-(như PlannerLogic._plan_rl). Nên chạy được cả model mới lẫn model cũ.
-
-    python3 test_frenet_rl.py [đường_dẫn_model]   # mặc định MODEL_PATH
+Nhóm kịch bản (--set, mặc định multi):
+  single — 1 vật quét ngang làn + đường trống + lệch heading ±20°
+  multi  — 2-3 vật dựng tay (zigzag, cổng, cùng phía, …)
+  hard   — kịch bản sinh ngẫu nhiên (sample_obstacle_layout, luôn khả thi),
+           nhiều vật, lấy từ đánh giá 200 ca của model 200k: 3 ca SAC còn thất
+           bại, 2 ca chỉ Frenet hết đường, 2 ca cả hai qua
 """
 
 from __future__ import annotations
 
+import argparse
 import math
 import multiprocessing as mp
 import os
-import sys
 
 import numpy as np
 
 from control.ekf import FrenetEKF
 from control.pure_pursuit import compute_cmd_vel
-from planner_motion.frenet_planner import FrenetOptimalPlanner
-from planner_motion.rl_policy import RLPolicy, decode_action
 
+from compare_rl_frenet import MULTI_SCENARIOS, FrenetPlanner, RLPlanner
 from train_frenet_rl import (
     ENV_CONFIG,
     PLANNER_CFG,
@@ -49,28 +51,43 @@ from train_frenet_rl import (
     sim_predict,
 )
 
-MODEL_PATH = os.path.join(MODELS_DIR, "sac_frenet_straight_robot_s1_50k")
-# Gate như control_node (PlannerLogic._plan_rl): False = policy luôn thấy vật cản.
-USE_GATE = True
+MODEL_PATH = os.path.join(MODELS_DIR, "sac_frenet_straight_multi_s1_200k")
 
-# Kịch bản cố định: obstacle đặt giữa đoạn đường (d0/psi0=0), quét NGANG qua
-# 7 vị trí d_obs cách nhau 0.5m (thay vì 3 vị trí cách 1.5m trước đây) để
-# đánh giá dày hơn qua toàn bộ bề ngang làn — từ -1.5 tới +1.5m (+d = phải,
-# nên trái là d âm). + 2 kịch bản KHÔNG obstacle nhưng heading lệch sẵn
-# (psi0=±20°) để thấy rõ dao động hội tụ của Pure Pursuit (đã verify bằng
-# script debug riêng: sau khi sửa dấu v_odom trong
-# FrenetStraightEnv.step()/run_cost_based, heading dao động TẮT DẦN về 0 —
-# không còn phân kỳ). (name, obstacle, d0, psi0).
+# Kịch bản: (tên, [(s tuyệt đối, d), ...], d0, psi0). +d = phải, -d = trái.
 S_OBS = ENV_CONFIG["course_length_m"] / 2.0
-_OBSTACLE_D_VALUES = [-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5]  # 0.5m/bước, giữa lane ±2.4m
-SCENARIOS = [("no_obstacle", None, 0.0, 0.0)]
-for _d in _OBSTACLE_D_VALUES:
+_SINGLE = [("no_obstacle", [], 0.0, 0.0)]
+for _d in (-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5):
     _tag = "center" if _d == 0.0 else (f"left{abs(_d):.1f}" if _d < 0 else f"right{_d:.1f}")
-    SCENARIOS.append((f"obstacle_{_tag}", (S_OBS, _d), 0.0, 0.0))
-SCENARIOS += [
-    ("heading_offset_left", None, 0.0, math.radians(20.0)),
-    ("heading_offset_right", None, 0.0, math.radians(-20.0)),
+    _SINGLE.append((f"obstacle_{_tag}", [(S_OBS, _d)], 0.0, 0.0))
+_SINGLE += [
+    ("heading_offset_left", [], 0.0, math.radians(20.0)),
+    ("heading_offset_right", [], 0.0, math.radians(-20.0)),
 ]
+_MULTI = [(name, obs, 0.0, 0.0) for name, obs in MULTI_SCENARIOS]
+
+
+def _generated(seed: int, name: str):
+    """Kịch bản từ bộ sinh của env (cùng seed với đánh giá 200 ca: 50000+ep)."""
+    env = FrenetStraightEnv(config={"canonical": False})
+    env.reset(seed=seed)
+    return (name, list(env._obstacles), float(env.ekf.state.d), float(env.ekf.state.psi))
+
+
+def _hard():
+    return [_generated(50_000 + ep, f"gen_ep{ep}_RL_fail") for ep in (51, 157, 178)] + \
+           [_generated(50_000 + ep, f"gen_ep{ep}_Frenet_fail") for ep in (10, 14)] + \
+           [_generated(50_000 + ep, f"gen_ep{ep}_both_ok") for ep in (39, 103)]
+
+
+def scenario_set(name: str):
+    if name == "single":
+        return _SINGLE
+    if name == "multi":
+        return _MULTI
+    if name == "hard":
+        return _hard()
+    return _SINGLE + _MULTI + _hard()
+
 
 # Tần suất THỰC SỰ VẼ LÊN MÀN HÌNH lại thấp hơn nhiều — draw_frenet_panel +
 # Tk draw_idle/flush_events có overhead đáng kể (đo thật: vẽ 1 panel ~4ms,
@@ -144,235 +161,161 @@ class LivePanel:
         plt.pause(pause)
 
 
-def _sac_action(policy: RLPolicy, env: FrenetStraightEnv) -> np.ndarray:
-    """Action ở khung THẬT cho env, qua đúng đường của robot (xem docstring
-    module). Obstacle đưa theo (ds tương đối, d) như PlannerLogic."""
-    ds_obs, d_obs, ds_real = env._obstacle_obs()
-    d, psi = float(env.ekf.state.d), float(env.ekf.state.psi)
-    obstacles = [(ds_obs, d_obs)] if math.isfinite(ds_real) else []
-    if obstacles and USE_GATE:
-        free = policy.action(d, psi, [], latch=False)
-        d_target, Ti = decode_action(free, policy.meta)
-        v = env.planner_cfg.target_speed
-        fp = env._build_path(d, v * math.sin(psi), d_target, Ti, v)
-        planner = env._planner
-        if planner._check_paths([fp], obstacles) and planner._obstacle_cost(fp, obstacles) == 0.0:
-            return free
-    return policy.action(d, psi, obstacles)
-
-
-def run_sac(policy: RLPolicy, d0: float, psi0: float, obstacle, live: LivePanel, title_prefix: str):
-    """Chạy 1 kịch bản SAC tới hết. Gọi trong process RIÊNG (xem
-    _run_method_process/main) nên không cần interleave với cost-based nữa —
-    mỗi process chỉ lo đúng 1 phương pháp, chạy thẳng tới hết."""
-    # canonical=False: env nhận action khung THẬT — RLPolicy đã tự lật gương.
-    env = FrenetStraightEnv(config={"canonical": False}, discretize_d_for_eval=True)
-    env.reset(options={"d0": d0, "psi0": psi0, "obstacle": obstacle})
-    policy.latch.reset()
-    traj_s = [env.s_ego]
-    traj_d = [float(env.ekf.state.d)]
-    collided = False
-    min_dist = math.inf
-    step_idx = 0
-    done = False
-    while not done:
-        _obs, _r, terminated, truncated, info = env.step(_sac_action(policy, env))
-        step_idx += 1
-        traj_s.append(env.s_ego)
-        traj_d.append(float(env.ekf.state.d))
-        min_dist = min(min_dist, info["closest_dist"])
-        if info.get("collided"):
-            collided = True
-        _animate_substeps(live, info, title=f"{title_prefix} (SAC) step={step_idx}")
-        done = terminated or truncated
-    return np.array(traj_s), np.array(traj_d), collided, min_dist
-
-
-def run_cost_based(d0: float, psi0: float, obstacle, live: LivePanel, title_prefix: str):
-    """Baseline: gọi lại NGUYÊN VẸN FrenetOptimalPlanner.plan() (cost-based,
-    enumerate di x Ti x tv) mỗi step, cùng nhịp mô phỏng/pure-pursuit/EKF
-    như env RL để so sánh công bằng. Chạy trong process riêng — xem
-    docstring run_sac()."""
+def run_scenario(planner, obstacles_abs, d0, psi0, live: "LivePanel", title: str):
+    """Chạy 1 kịch bản với vòng 40 Hz giống robot. planner.plan(d, psi, v,
+    obstacles_rel) trả FrenetPath hoặc None. Mỗi "step" hiển thị = dt (0.5 s)
+    gồm n_sub tick; animation phát lại pose thật từng tick."""
     cfg = ENV_CONFIG
-    planner = FrenetOptimalPlanner(PLANNER_CFG)
+    planner.reset()
     ekf = FrenetEKF()
     ekf.x = np.array([d0, psi0])
     s_ego = 0.0
-    traj_s = [s_ego]
-    traj_d = [float(ekf.state.d)]
-    collided = False
-    min_dist = math.inf
-    step_idx = 0
-
+    v = PLANNER_CFG.target_speed
     n_sub = max(1, round(cfg["dt"] * cfg["pp_rate_hz"]))
     sub_dt = cfg["dt"] / n_sub
-    c_speed = PLANNER_CFG.target_speed
-    for _ in range(cfg["max_episode_steps"]):
-        # 1 "step" hiển thị = dt; bên trong pure pursuit chạy pp_rate_hz và
-        # Frenet lập đường lại MỖI tick (như robot, xem env RL).
+    traj_s, traj_d = [s_ego], [float(ekf.state.d)]
+    min_dist, stuck, step_idx = math.inf, False, 0
+
+    def dist_now():
+        return min((math.hypot(so - s_ego, do - float(ekf.state.d)) for so, do in obstacles_abs),
+                   default=math.inf)
+
+    while s_ego < cfg["course_length_m"] and not stuck:
         d_first, psi_first, s_first = float(ekf.state.d), float(ekf.state.psi), s_ego
-        first = None
-        trace = []
+        first, trace = None, []
         for _k in range(n_sub):
-            d = float(ekf.state.d)
-            psi = float(ekf.state.psi)
-            obstacles_relative = []
-            if obstacle is not None:
-                s_obs_abs, d_obs = obstacle
-                obstacles_relative.append((s_obs_abs - s_ego, d_obs))
-            best, _candidates = planner.plan(0.0, c_speed, d, c_speed * math.sin(psi), 0.0, obstacles_relative)
-            if best is None:
-                collided = True
+            d, psi = float(ekf.state.d), float(ekf.state.psi)
+            visible = [(so - s_ego, do) for so, do in obstacles_abs
+                       if 0.0 <= so - s_ego <= cfg["vision_range_m"]]
+            fp = planner.plan(d, psi, v, visible)
+            if fp is None:
+                stuck = True
                 break
-            min_dist = min(min_dist, FrenetStraightEnv._closest_obstacle_dist(best, obstacles_relative))
-            linear_x, angular_z, target_s, target_d = compute_cmd_vel(
-                best.s, best.d, 0.0, d, psi, c_speed, PP_CFG,
-            )
+            linear_x, angular_z, target_s, target_d = compute_cmd_vel(fp.s, fp.d, 0.0, d, psi, v, PP_CFG)
             if first is None:
-                first = (best, target_s, target_d, linear_x, angular_z)
+                first = (fp, target_s, target_d, linear_x, angular_z)
             sim_predict(ekf, linear_x, angular_z, sub_dt)
             s_ego += linear_x * math.cos(psi) * sub_dt
             trace.append((s_ego, float(ekf.state.d), float(ekf.state.psi)))
+            min_dist = min(min_dist, dist_now())
         if first is None:
             break
-        best, target_s, target_d, linear_x, angular_z = first
+        fp, target_s, target_d, linear_x, angular_z = first
         step_idx += 1
         traj_s.append(s_ego)
         traj_d.append(float(ekf.state.d))
-
-        # info tương thích render_frenet_panel — cost-based không có "Ti"
-        # tường minh trên FrenetPath, suy ra gần đúng từ mẫu thời gian cuối
-        # path (best.t[-1] + dt ≈ Ti) — chỉ để vẽ quạt minh hoạ.
+        fallback = getattr(planner, "fallback_ticks", 0)
         info = {
-            "path_d": best.d.tolist(),
-            "path_s": best.s.tolist(),
+            "path_d": fp.d.tolist(),
+            "path_s": fp.s.tolist(),
             "d_before": d_first,
             "psi_before": psi_first,
             "s_ego_before": s_first,
-            "Ti": float(best.t[-1] + PLANNER_CFG.dt) if len(best.t) else PLANNER_CFG.min_t,
+            # Ti gần đúng từ mẫu thời gian cuối path — chỉ để vẽ quạt minh hoạ.
+            "Ti": float(fp.t[-1] + PLANNER_CFG.dt) if len(fp.t) else PLANNER_CFG.min_t,
             "target_s": target_s,
             "target_d": target_d,
-            "obstacle": obstacle,
+            "obstacles": obstacles_abs,
             "linear_x": linear_x,
             "angular_z": angular_z,
             "trace": trace,
         }
-        _animate_substeps(live, info, title=f"{title_prefix} (cost-based) step={step_idx}")
-
-        if collided or abs(float(ekf.state.d)) > cfg["d_max_offset_m"]:
+        extra = f" Frenet thay={fallback}" if hasattr(planner, "fallback_ticks") else ""
+        _animate_substeps(live, info, title=f"{title} step={step_idx}{extra}")
+        if abs(float(ekf.state.d)) > cfg["d_max_offset_m"]:
             break
-        if s_ego >= cfg["course_length_m"]:
-            break
+    failed = stuck or min_dist <= PLANNER_CFG.robot_radius
+    return dict(traj_s=traj_s, traj_d=traj_d, failed=failed, stuck=stuck, min_dist=min_dist,
+                fallback=getattr(planner, "fallback_ticks", 0))
 
-    return np.array(traj_s), np.array(traj_d), collided, min_dist
+
+class _CountingRLPlanner(RLPlanner):
+    """RLPlanner + đếm số tick phải dùng Frenet (đường RL bị loại)."""
+
+    def reset(self):
+        super().reset()
+        self.fallback_ticks = 0
+        if not hasattr(self, "_orig_plan"):
+            self._orig_plan = self.planner.plan
+
+            def counted(*a, **k):
+                self.fallback_ticks += 1
+                return self._orig_plan(*a, **k)
+            self.planner.plan = counted
 
 
-def _run_method_process(method: str, model_path: str, result_queue) -> None:
-    """Chạy trong PROCESS CON RIÊNG (spawn) — mở cửa sổ live CỦA RIÊNG
-    process này (OverlayRenderer/FrenetStraightEnv không share được giữa
-    process nên phải tạo lại), chạy tuần tự qua toàn bộ SCENARIOS cho ĐÚNG
-    1 phương pháp, rồi gửi kết quả về process cha qua Queue. 2 process này
-    chạy THỰC SỰ song song (2 tiến trình OS riêng, có thể trên 2 core khác
-    nhau) — khác hẳn interleave trong 1 process (vẫn tuần tự ở mức CPU)."""
+def _run_method_process(method: str, model_path: str, set_name: str, result_queue) -> None:
+    """Chạy trong PROCESS CON RIÊNG (spawn) — cửa sổ live của riêng process
+    này, chạy tuần tự qua toàn bộ kịch bản cho ĐÚNG 1 phương pháp, gửi kết quả
+    về process cha qua Queue. 2 process chạy thật song song."""
     live = LivePanel(name=method)
-    model = RLPolicy(model_path) if method == "SAC" else None
-
+    planner = _CountingRLPlanner(model_path) if method == "SAC" else FrenetPlanner()
     results = []
-    for name, obstacle, d0, psi0 in SCENARIOS:
-        if method == "SAC":
-            traj_s, traj_d, collided, min_dist = run_sac(
-                model, d0, psi0, obstacle, live, title_prefix=name
-            )
-        else:
-            traj_s, traj_d, collided, min_dist = run_cost_based(
-                d0, psi0, obstacle, live, title_prefix=name
-            )
-        results.append((name, traj_s.tolist(), traj_d.tolist(), collided, min_dist))
+    for name, obstacles, d0, psi0 in scenario_set(set_name):
+        results.append((name, run_scenario(planner, obstacles, d0, psi0, live, title=f"{name} ({method})")))
     result_queue.put(results)
-
     if INTERACTIVE_PLOTS:
-        # Gửi kết quả về cha XONG mới block chờ đóng cửa sổ — cha không cần
-        # đợi user đóng cửa sổ mới in được bảng/vẽ plot so sánh.
+        # Gửi kết quả về cha XONG mới block chờ đóng cửa sổ.
         plt.show(block=True)
 
 
-def _plot_scenario(name: str, obstacle, sac_traj, cost_traj) -> None:
-    sac_s, sac_d, _, _ = sac_traj
-    cost_s, cost_d, _, _ = cost_traj
+def _plot_scenario(name: str, obstacles, sac, cost) -> None:
     fig, ax = plt.subplots(figsize=(7, 3))
     ax.axhline(0.0, color="gray", linestyle="--", linewidth=1, label="reference line")
-    if obstacle is not None:
-        s_o, d_o = obstacle
-        ax.scatter([s_o], [d_o], c="red", marker="x", s=90, label="obstacle")
-    ax.plot(cost_s, cost_d, c="tab:orange", label="cost-based planner")
-    ax.plot(sac_s, sac_d, c="tab:blue", label="SAC (rounded to grid)")
+    if obstacles:
+        ax.scatter([o[0] for o in obstacles], [o[1] for o in obstacles], c="red", marker="x", s=90,
+                   label="obstacle")
+        for so, do in obstacles:
+            ax.add_patch(plt.Circle((so, do), PLANNER_CFG.robot_radius, color="red", alpha=0.12))
+    ax.plot(cost["traj_s"], cost["traj_d"], c="tab:orange", label="Frenet cost-based")
+    ax.plot(sac["traj_s"], sac["traj_d"], c="tab:blue", label="SAC (+ Frenet khi đường RL bị loại)")
     ax.set_xlabel("s [m]")
-    ax.set_ylabel("d [m]")
+    ax.set_ylabel("d [m]  (+ phải, − trái)")
+    ax.set_ylim(-2.6, 2.6)
     ax.set_title(f"Scenario: {name}")
-    ax.legend(loc="upper right")
+    ax.legend(loc="upper right", fontsize=7)
     fig.tight_layout()
     fig.savefig(os.path.join(PLOTS_DIR, f"test_{name}.png"))
     plt.close(fig)
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("model", nargs="?", default=MODEL_PATH)
+    ap.add_argument("--set", default="multi", choices=("single", "multi", "hard", "all"))
+    args = ap.parse_args()
     os.makedirs(PLOTS_DIR, exist_ok=True)
+    scenarios = scenario_set(args.set)
+    print(f"[RUN] model: {args.model} | nhóm kịch bản: {args.set} ({len(scenarios)})", flush=True)
 
-    # 2 PROCESS OS riêng (spawn — an toàn với Tk/matplotlib, tránh vấn đề
-    # fork+GUI) — mỗi process chạy ĐÚNG 1 phương pháp qua toàn bộ SCENARIOS,
-    # mở cửa sổ live của riêng nó. Chạy thật song song (không chỉ interleave
-    # trong 1 process), có thể trên 2 core CPU khác nhau.
+    # 2 process OS riêng (spawn — an toàn với Tk/matplotlib), mỗi process 1
+    # phương pháp, cửa sổ live riêng, chạy song song.
     ctx = mp.get_context("spawn")
     q_sac: "mp.Queue" = ctx.Queue()
     q_cost: "mp.Queue" = ctx.Queue()
-    model_path = sys.argv[1] if len(sys.argv) > 1 else MODEL_PATH
-    print(f"[RUN] model: {model_path}", flush=True)
-    p_sac = ctx.Process(target=_run_method_process, args=("SAC", model_path, q_sac))
-    p_cost = ctx.Process(target=_run_method_process, args=("cost-based", MODEL_PATH, q_cost))
-
-    print("[RUN] 2 process song song: SAC + cost-based ...", flush=True)
+    p_sac = ctx.Process(target=_run_method_process, args=("SAC", args.model, args.set, q_sac))
+    p_cost = ctx.Process(target=_run_method_process, args=("Frenet", args.model, args.set, q_cost))
     p_sac.start()
     p_cost.start()
+    sac_by_name = dict(q_sac.get())
+    cost_by_name = dict(q_cost.get())
 
-    # get() chỉ chờ tới khi mỗi process GỬI xong kết quả (ngay sau vòng lặp
-    # scenario) — KHÔNG cần đợi cửa sổ live của nó được đóng.
-    sac_by_name = {r[0]: r for r in q_sac.get()}
-    cost_by_name = {r[0]: r for r in q_cost.get()}
-
-    rows = []
-    for name, obstacle, d0, psi0 in SCENARIOS:
-        _n, sac_s, sac_d, sac_collided, sac_min_dist = sac_by_name[name]
-        _n, cost_s, cost_d, cost_collided, cost_min_dist = cost_by_name[name]
-        sac_traj = (np.array(sac_s), np.array(sac_d), sac_collided, sac_min_dist)
-        cost_traj = (np.array(cost_s), np.array(cost_d), cost_collided, cost_min_dist)
-        _plot_scenario(name, obstacle, sac_traj, cost_traj)
-
-        for tag, (traj_s, traj_d, collided, min_dist) in (
-            ("SAC", sac_traj), ("cost-based", cost_traj),
-        ):
-            rows.append({
-                "scenario": name,
-                "planner": tag,
-                "collided": collided,
-                "mean_abs_d": float(np.mean(np.abs(traj_d))),
-                "std_abs_d": float(np.std(np.abs(traj_d))),
-                "min_dist_to_obstacle": min_dist if math.isfinite(min_dist) else float("nan"),
-            })
-
-    header = f"{'scenario':<22}{'planner':<12}{'collided':<10}{'mean|d|':<10}{'std|d|':<10}{'min_dist':<10}"
+    header = (f"{'scenario':<26}{'planner':<8}{'thất bại':<10}{'hết đường':<11}"
+              f"{'min_dist':<10}{'mean|d|':<9}{'Frenet thay':<12}")
     print(header)
     print("-" * len(header))
-    for r in rows:
-        print(
-            f"{r['scenario']:<22}{r['planner']:<12}{str(r['collided']):<10}"
-            f"{r['mean_abs_d']:<10.3f}{r['std_abs_d']:<10.3f}{r['min_dist_to_obstacle']:<10.3f}"
-        )
-
-    for tag in ("SAC", "cost-based"):
-        n = sum(1 for r in rows if r["planner"] == tag)
-        n_collided = sum(1 for r in rows if r["planner"] == tag and r["collided"])
-        print(f"\n{tag}: tỉ lệ va chạm = {n_collided}/{n} kịch bản")
-
+    totals = {"SAC": 0, "Frenet": 0}
+    for name, obstacles, _d0, _psi0 in scenarios:
+        sac, cost = sac_by_name[name], cost_by_name[name]
+        _plot_scenario(name, obstacles, sac, cost)
+        for tag, r in (("SAC", sac), ("Frenet", cost)):
+            totals[tag] += r["failed"]
+            md = f"{r['min_dist']:.2f}" if math.isfinite(r["min_dist"]) else "—"
+            fb = str(r["fallback"]) if tag == "SAC" else "—"
+            print(f"{name:<26}{tag:<8}{str(r['failed']):<10}{str(r['stuck']):<11}{md:<10}"
+                  f"{float(np.mean(np.abs(r['traj_d']))):<9.3f}{fb:<12}")
+    for tag, n in totals.items():
+        print(f"\n{tag}: thất bại {n}/{len(scenarios)} kịch bản")
     print(f"\nPlots lưu trong {PLOTS_DIR}/test_<scenario>.png")
     if INTERACTIVE_PLOTS:
         print("Xem xong — đóng cả 2 cửa sổ panel để 2 process kết thúc.")

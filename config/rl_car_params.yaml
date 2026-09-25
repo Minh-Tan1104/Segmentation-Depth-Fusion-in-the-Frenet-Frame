@@ -30,7 +30,7 @@
     plan_road_width: 2.5                 # nửa bề rộng lấy mẫu ngang khi enumerate ứng viên [m]
     plan_max_curvature: 20.0               # độ cong tối đa cho phép của quỹ đạo [1/m]
     plan_lookahead: 1.54                  # thời gian nhìn trước để lấy target_d [s]
-    plan_clearance: 3.2                  # khoảng cách mềm để né vật cản [m]
+    plan_clearance: 1.2                  # khoảng cách mềm để né vật cản [m] (giảm từ 3.2)
     plan_obstacle_weight: 20.0           # trọng số phạt khi quỹ đạo đi gần vật cản
     plan_center_offset: 0.0           # +d = lệch điểm giữa làn sang phải [m]
     plan_center_weight: 20.0              # phạt lệch center_offset (k_d) — tăng lên = planner chấp nhận
@@ -116,7 +116,7 @@ control_node:
     # Đường dẫn TUYỆT ĐỐI tới model .zip (hỗ trợ ~); cần file <tên>.meta.json cạnh nó
     # (train_frenet_rl.py tự ghi). models/ không được colcon cài vào install/.
     # Train với chính tham số robot trong file này (xem README). Model cũ vẫn dùng được.
-    plan_rl_model_path: "~/ros2_ws/src/RL_CAR/models/sac_frenet_straight_robot_s1_50k.zip"
+    plan_rl_model_path: "~/ros2_ws/src/RL_CAR/models/sac_frenet_straight_multi_s1_200k.zip"
     # --- GPS assist (Gps/route_ekf.py) — CHỈ dùng d/psi_err từ GPS khi mất
     # vision quá lâu VÀ GPS đủ tin cậy; mặc định TẮT (an toàn), xem
     # control/node.py _planner_tick cho logic chuyển nguồn. GPS không bao

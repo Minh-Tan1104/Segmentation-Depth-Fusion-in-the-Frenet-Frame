@@ -71,6 +71,7 @@ from planner_motion.rl_policy import (
     SideLatch,
     canonical_observation,
     build_observation,
+    obstacles_ahead,
     decode_action,
     meta_path,
     obs_high,
@@ -141,16 +142,18 @@ RL_META = RLPolicyMeta(
     min_t=PLANNER_CFG.min_t,
     max_t=PLANNER_CFG.max_t,
     vision_range_m=VISION_RANGE_M,
-    # has_obstacle trong obs: không có nó, "đường trống" trùng observation
-    # với "obstacle giữa làn vừa vào tầm nhìn" -> oversample obstacle giữa
-    # làn làm policy lệch sẵn 1 bên cả khi đường trống (đo: -0.37m).
-    obs_version=2,
     # Khung gương (SideLatch, xem rl_policy.py): policy luôn thấy vật cản ở
     # trái-hoặc-thẳng xe. Không có nó, policy liên tục buộc phải có 1 dải
     # d_target≈0 quanh d_obs≈d_xe (chuyển giữa né phải/né trái) — đo: model
     # thường va 18/87 ca vật cản sát giữa; chỉ thêm khung gương lúc chạy
     # (không train lại) đã còn 0/87.
     canonical=True,
+    # Tối đa 3 vật gần nhất trong observation, mỗi vật có cờ present (thay
+    # has_obstacle của v2: tách "đường trống" khỏi "vật giữa làn ở mép tầm
+    # nhìn"). Cụm 2-3 vật có thể cùng lúc trong tầm nhìn; chỉ thấy vật gần
+    # nhất thì né vào vật thứ hai.
+    obs_version=3,
+    max_obstacles=3,
 )
 assert RL_META.center_offset == 0.0, "khung gương lật action quanh tâm làn"
 
@@ -200,8 +203,8 @@ ENV_CONFIG = {
 
     # Phạt kết thúc phải ĐẮT HƠN chi phí vượt qua 1 vật cản, nếu không policy
     # học cố tình đâm/lao khỏi làn để né chi phí đó. Với chi phí robot (k_obs
-    # 20, clearance 3.2 m) vượt 1 vật cản tốn ~860 (tới -57/step) — r_collision
-    # 100 cũ < 860 + ~95 thưởng tương lai. 3000 dư an toàn cho chuỗi vật cản.
+    # 20) vượt 1 vật cản tốn ~860 ở clearance 3.2 m, ~460 ở 1.2 m (tới
+    # -33/step) — r_collision 100 cũ nhỏ hơn. 3000 dư an toàn cho cụm vật cản.
     "r_collision": 3000.0,  # path không khả thi (va chạm HOẶC vi phạm tốc
                              # độ/gia tốc/độ cong — xem _check_paths)
     "r_offlane": 3000.0,    # |d| vượt d_max_offset_m (kết thúc episode)
@@ -244,8 +247,19 @@ ENV_CONFIG = {
     # thiểu > vision_range_m (8m) -> thường chỉ thấy 1 vật mỗi lúc (obs chỉ
     # mô tả vật gần nhất), nhưng vẫn đủ gần để vật sau không "chắc chắn trống".
     "first_obstacle_s_m": (10.0, 25.0),
-    "obstacle_gap_m": (12.0, 25.0),
-    "obstacle_prob": 0.7,
+    "obstacle_gap_m": (12.0, 25.0),   # từ vật CUỐI cụm trước tới vật đầu cụm sau
+    "obstacle_prob": 0.7,             # xác suất mỗi vị trí cụm có vật
+    # Cụm 1-3 vật (R1): số vật theo xác suất, các vật trong cụm nằm trong
+    # cluster_len_m theo s — có thể thấy 2-3 vật cùng lúc (tầm nhìn 8 m).
+    "cluster_size_probs": (0.5, 0.3, 0.2),
+    "cluster_len_m": 6.0,
+    "obstacle_d_max_m": 1.8,          # R2: |d_obs| <= 1.8 m (vật nằm trên đường)
+    # Kiểm tra khả thi hình học (feasible_layout):
+    "row_len_m": 1.5,                 # vật cách nhau < row_len theo s = cùng hàng
+    "feas_margin_m": 0.3,             # R4: khe cách mọi vật >= robot_radius + margin
+    "feas_lane_m": 2.2,               # tâm xe phải ở |d| <= feas_lane_m (< off-lane 2.4)
+    "feas_max_slope": 0.4,            # R5: dịch ngang <= slope * quãng dọc giữa 2 hàng
+    "layout_max_tries": 30,           # số lần sinh lại 1 cụm trước khi bỏ cụm đó
     # Tần số pure pursuit trong mỗi step (robot: 40 Hz). Đường lập lại mỗi tick.
     "pp_rate_hz": 40.0,
     "init_d_range_m": 0.3,
@@ -294,6 +308,86 @@ def sim_predict(ekf: FrenetEKF, linear_x: float, angular_z: float, dt: float) ->
     định nhờ lookahead mặc định dài 3 m. Chỉ trong mô phỏng — không sửa
     control/ekf.py hay control/pure_pursuit.py."""
     ekf.predict(v_odom=linear_x, omega_odom=-angular_z, dt=dt)
+
+
+def _free_intervals(row_d: list[float], half_block: float, lane: float) -> list[tuple[float, float]]:
+    """Khoảng ngang [-lane, lane] còn trống sau khi chặn [d_o ± half_block]."""
+    blocked = sorted((d - half_block, d + half_block) for d in row_d)
+    free, lo = [], -lane
+    for a, b in blocked:
+        if a > lo:
+            free.append((lo, min(a, lane)))
+        lo = max(lo, b)
+    if lo < lane:
+        free.append((lo, lane))
+    return [(a, b) for a, b in free if b >= a]
+
+
+def feasible_layout(obstacles: list[tuple[float, float]], d0: float, cfg: dict,
+                    robot_radius: float) -> bool:
+    """Kịch bản vật cản có TỒN TẠI đường đi cho xe không (hình học, không phụ
+    thuộc planner). Gom vật thành hàng (cách nhau < row_len_m theo s); đi lần
+    lượt từng hàng, giữ tập vị trí ngang xe có thể có:
+      - R5: giữa 2 hàng cách nhau Δs, tập đó nở ra ± feas_max_slope*Δs;
+      - R4: giao với khe trống của hàng (cách mọi vật >= robot_radius +
+        feas_margin_m, trong làn |d| <= feas_lane_m).
+    Tập rỗng ở hàng nào = không có đường -> bất khả thi. (R3 — 2 vật cùng
+    hàng quá sát — bị R4 bao hàm: khe giữa chúng không đủ rộng.)"""
+    if not obstacles:
+        return True
+    obs = sorted(obstacles)
+    rows, cur = [], [obs[0]]
+    for o in obs[1:]:
+        if o[0] - cur[-1][0] < cfg["row_len_m"]:
+            cur.append(o)
+        else:
+            rows.append(cur); cur = [o]
+    rows.append(cur)
+    lane, half = cfg["feas_lane_m"], robot_radius + cfg["feas_margin_m"]
+    reach, s_prev = [(d0, d0)], 0.0
+    for row in rows:
+        grow = cfg["feas_max_slope"] * max(0.0, row[0][0] - s_prev)
+        reach = [(max(-lane, a - grow), min(lane, b + grow)) for a, b in reach]
+        free = _free_intervals([d for _, d in row], half, lane)
+        reach = [(max(a, fa), min(b, fb)) for a, b in reach for fa, fb in free
+                 if max(a, fa) <= min(b, fb)]
+        if not reach:
+            return False
+        s_prev = row[-1][0]
+    return True
+
+
+def sample_obstacle_layout(rng: np.random.Generator, cfg: dict, d0: float,
+                           robot_radius: float) -> list[tuple[float, float]]:
+    """Chuỗi cụm 1-3 vật dọc đường (R1, R2); mỗi cụm được sinh lại tới khi cả
+    kịch bản tính tới cụm đó còn khả thi (feasible_layout), quá
+    layout_max_tries thì bỏ cụm."""
+    layout: list[tuple[float, float]] = []
+    s_pos = float(rng.uniform(*cfg["first_obstacle_s_m"]))
+    end = cfg["course_length_m"] - 5.0
+    while s_pos < end:
+        if rng.uniform() >= cfg["obstacle_prob"]:
+            s_pos += float(rng.uniform(*cfg["obstacle_gap_m"]))
+            continue
+        cluster = None
+        for _ in range(cfg["layout_max_tries"]):
+            n = int(rng.choice(len(cfg["cluster_size_probs"]), p=cfg["cluster_size_probs"])) + 1
+            offs = np.sort(np.concatenate([[0.0], rng.uniform(0.0, cfg["cluster_len_m"], n - 1)]))
+            cand = []
+            for off in offs:
+                if rng.uniform() < cfg["center_obstacle_prob"]:
+                    d_o = rng.uniform(-cfg["center_obstacle_band_m"], cfg["center_obstacle_band_m"])
+                else:
+                    d_o = rng.uniform(-cfg["obstacle_d_max_m"], cfg["obstacle_d_max_m"])
+                cand.append((min(s_pos + float(off), end), float(d_o)))
+            if feasible_layout(layout + cand, d0, cfg, robot_radius):
+                cluster = cand
+                break
+        if cluster is not None:
+            layout += cluster
+            s_pos = cluster[-1][0]
+        s_pos += float(rng.uniform(*cfg["obstacle_gap_m"]))
+    return sorted(layout)
 
 
 def _round_to_grid(d_value: float, d_road_w: float, center_offset: float) -> float:
@@ -362,25 +456,13 @@ class FrenetStraightEnv(gym.Env):
         elif "obstacle" in options:
             self._obstacles = [options["obstacle"]] if options["obstacle"] is not None else []
         else:
-            # CHUỖI vật cản rải suốt đường, không phải 1 vật/episode. Với 1
+            # CHUỖI cụm vật cản rải suốt đường, không phải 1 vật/episode. Với 1
             # vật, "xe lệch + đường trống" trong dữ liệu gần như luôn = "vừa né
-            # xong, phía trước chắc chắn trống, sắp tới goal" -> critic học
-            # tương quan giả "lệch = an toàn" (đo: Q theo d hình chữ V, đáy ở
-            # tâm -5.7, lệch 0.75m +17) và policy cố tình trôi ra ~0.75m, dù
-            # return thật khi giữ tâm cao hơn hẳn (90 vs 37). Chuỗi vật cản
-            # làm tương lai khi đường trống không phụ thuộc lịch sử né.
-            cfg = self.cfg
-            self._obstacles = []
-            s_obs = float(self._rng.uniform(*cfg["first_obstacle_s_m"]))
-            while s_obs < cfg["course_length_m"] - 5.0:
-                if self._rng.uniform() < cfg["obstacle_prob"]:
-                    if self._rng.uniform() < cfg["center_obstacle_prob"]:
-                        band = cfg["center_obstacle_band_m"]
-                        d_obs = float(self._rng.uniform(-band, band))
-                    else:
-                        d_obs = float(self._rng.uniform(D_MIN_OFFSET * 0.75, D_MAX_OFFSET * 0.75))
-                    self._obstacles.append((s_obs, d_obs))
-                s_obs += float(self._rng.uniform(*cfg["obstacle_gap_m"]))
+            # xong, phía trước chắc chắn trống" -> critic học tương quan giả
+            # "lệch = an toàn" (đo: Q theo d hình chữ V) và policy cố tình trôi
+            # ra ~0.75m. Mỗi cụm 1-3 vật, luôn khả thi (sample_obstacle_layout).
+            self._obstacles = sample_obstacle_layout(
+                self._rng, self.cfg, d0, self.planner_cfg.robot_radius)
 
         self.s_ego = 0.0
         self.step_count = 0
@@ -468,6 +550,7 @@ class FrenetStraightEnv(gym.Env):
         info["target_s"] = target_s
         info["target_d"] = target_d
         info["obstacle"] = self.obstacle
+        info["obstacles"] = list(self._obstacles)
         # Lệnh Pure Pursuit THẬT đã áp dụng cho tick này — chỉ để caller (test
         # script) phát lại chuyển động mượt cho hiển thị real-time (xem
         # test_frenet_rl.py:_animate_substeps), không ảnh hưởng state/reward.
@@ -538,14 +621,18 @@ class FrenetStraightEnv(gym.Env):
             return cfg["vision_range_m"], 0.0, math.inf
         return ds, d_obs, ds
 
+    def visible_obstacles(self) -> list[tuple[float, float]]:
+        """Tối đa max_obstacles vật (ds, d) trong tầm nhìn, gần nhất trước."""
+        return obstacles_ahead([(s_o - self.s_ego, d_o) for s_o, d_o in self._obstacles],
+                               self.cfg["vision_range_m"], RL_META.max_obstacles)
+
     def _obs(self) -> np.ndarray:
-        ds_obs, d_obs, ds_real = self._obstacle_obs()
-        obstacle = (ds_obs, d_obs) if math.isfinite(ds_real) else None
+        visible = self.visible_obstacles()
         d, psi = float(self.ekf.state.d), float(self.ekf.state.psi)
         if not self.cfg["canonical"]:
-            return build_observation(d, psi, obstacle, RL_META)
-        self._side = self._latch.update(d, obstacle)
-        return canonical_observation(d, psi, obstacle, self._side, RL_META)
+            return build_observation(d, psi, visible, RL_META)
+        self._side = self._latch.update(d, visible[0] if visible else None)
+        return canonical_observation(d, psi, visible, self._side, RL_META)
 
     def _reward_and_done(self, d, psi, feasible, cost, closest_dist):
         """reward = -cost, với cost = fp.cf + k_obs*obstacle_cost(fp, obstacles)
@@ -630,9 +717,11 @@ def render_frenet_panel(
     optimal_path = list(zip(info["path_d"], info["path_s"]))
 
     detections = []
-    obstacle = info.get("obstacle")
-    if obstacle is not None:
-        s_obs_abs, d_obs = obstacle
+    # "obstacles": mọi vật (s tuyệt đối, d); "obstacle": 1 vật (định dạng cũ).
+    obstacles = info.get("obstacles")
+    if obstacles is None:
+        obstacles = [info["obstacle"]] if info.get("obstacle") is not None else []
+    for s_obs_abs, d_obs in obstacles:
         ds_obs = s_obs_abs - s_ego_before
         detections.append({
             "label": "obs",

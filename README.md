@@ -186,7 +186,7 @@ under `control_node`:
 
 ```yaml
 plan_use_rl: true        # false = classical Frenet cost-based (default)
-plan_rl_model_path: "~/ros2_ws/src/RL_CAR/models/sac_frenet_straight_robot_s1_50k.zip"
+plan_rl_model_path: "~/ros2_ws/src/RL_CAR/models/sac_frenet_straight_multi_s1_200k.zip"
 ```
 
 It needs `stable-baselines3` and `torch` on the car; they are only imported
@@ -196,24 +196,31 @@ tick falls back to the classical planner and `control_node` logs a warning,
 so an RL mistake never reaches the motors.
 
 Obstacles are only shown to the policy when they matter. Each tick first
-asks the policy for its plain lane-keeping path. If that path is feasible
-and stays outside every obstacle's clearance, it is used as is. Without
-this gate the policy also swerved around obstacles it would have passed
-safely going straight (in sim: 0.4–0.65 m of drift for obstacles 1.4–2 m
-to the side, where the classical planner stays centred).
+asks the policy for its plain lane-keeping path. The gate extends that path
+to the end of the vision range at its final offset. If the path is feasible
+and every obstacle stays outside its clearance, the path is used as is.
+Without this gate the policy swerved around obstacles it could have passed
+going straight. The extension matters with the robot's settings: a path is
+only 2–3 m long, while obstacles are visible up to 8 m. Checking the short
+path alone let the car drive straight at obstacles 3–6 m ahead until it was
+too late to avoid them (9 of 20 multi-obstacle failures).
 
 **How it was trained** — `train_frenet_rl.py` wraps the straight-mode
 planner in a Gymnasium environment:
 
-- **Observation:** `[d, psi, distance to the nearest obstacle ahead, its
-  lateral offset, obstacle-in-view flag]`, seen in a mirrored frame (below).
+- **Observation:** `[d, psi]` plus, for each of the 3 nearest obstacles
+  ahead, `[distance, lateral offset, present flag]`, seen in a mirrored frame
+  (below). The mirror side is latched on the nearest obstacle.
 - **Reward:** the negative of the classical planner's cost (jerk, time,
   centre offset, obstacle clearance) plus a constant per-step bonus, with
   terminal penalties for collision and leaving the lane. A constant shift
   does not change which action is cheaper, so the policy optimises the same
   objective the classical planner minimises by search.
-- **Episodes:** a stream of static obstacles along the road (12–25 m apart,
-  each present with probability 0.7, 20 % of them near the centreline).
+- **Episodes:** a stream of static obstacle clusters along the road
+  (clusters 12–25 m apart, each present with probability 0.7). Each cluster
+  holds 1–3 obstacles within 6 m, so up to 3 can be in view at once; 20 %
+  of obstacles are near the centreline. Every layout is checked for
+  feasibility and regenerated if it fails (see below).
 - **Robot settings:** planner (`plan_*`) and pure pursuit (`lookahead_distance`,
   `max_wheel_speed`) parameters are read from
   [`config/rl_car_params.yaml`](config/rl_car_params.yaml), so the policy
@@ -223,8 +230,23 @@ planner in a Gymnasium environment:
   On the car the policy is queried on every planner tick.
 - **Terminal penalties** (collision, leaving the lane) are 3000, and all
   rewards are scaled by 0.05. With the robot's obstacle cost, passing one
-  obstacle costs ~860, so smaller penalties would make crashing cheaper than
-  passing.
+  obstacle costs ~460 (clearance 1.2 m), so smaller penalties would make
+  crashing cheaper than passing.
+
+**Feasibility constraints** (`feasible_layout` in `train_frenet_rl.py`).
+These are geometric and independent of any planner:
+
+| # | Constraint |
+|---|---|
+| R1 | 1–3 obstacles per cluster, spread over at most 6 m; clusters 12–25 m apart. |
+| R2 | Every obstacle is on the road: \|d\| ≤ 1.8 m. |
+| R3/R4 | Obstacles closer than 1.5 m along the road form a row. Each row must leave a gap inside the lane (\|d\| ≤ 2.2 m) at least 0.9 m (robot radius 0.6 + 0.3 m margin) from every obstacle. |
+| R5 | Between consecutive rows the car can shift sideways by at most 0.4 × the distance between them. |
+
+A dynamic programme propagates the reachable lateral intervals from row to
+row. If the set becomes empty, the layout is infeasible. Frenet is not used
+as the filter because, with the robot's settings, it cannot pass even a
+single centred obstacle.
 
 Three design choices fix failures seen in earlier models:
 
@@ -243,7 +265,8 @@ meta fields still load and run as before.
 
 Models in `models/`:
 
-- `sac_frenet_straight_robot_s1_50k.zip` — the current model (robot settings, seed 1, 50k steps), and the one the config points to.
+- `sac_frenet_straight_multi_s1_200k.zip` — the current model, and the one the config points to. Robot settings, clearance 1.2 m, 1–3 obstacle clusters, 3-obstacle observation, seed 1, 200k steps.
+- `sac_frenet_straight_robot_s1_50k.zip` — the previous model: robot settings with clearance 3.2 m, one obstacle at a time, 50k steps.
 - `sac_frenet_straight_v2.zip` — same design, but trained on the earlier simulation (training-script planner settings, old sign handling, 2 Hz pure pursuit). Its results below do not transfer to the car.
 - `sac_frenet_straight.zip` / `sac_frenet_straight_center.zip` — the previous model (centred-obstacle oversampling, no mirrored frame). Avoids centred obstacles but drifts ~0.4–0.9 m off the lane centre.
 - `sac_frenet_straight_old.zip` — the model before that. Good lane keeping, but drives into centred obstacles.
@@ -251,34 +274,52 @@ Models in `models/`:
 ```bash
 pip install -r requirements.txt
 python3 train_frenet_rl.py            # trains, writes models/sac_frenet_straight.zip + .meta.json
-python3 test_frenet_rl.py [model]     # SAC vs classical on 10 fixed scenarios, animated
-python3 compare_rl_frenet.py [model]  # SAC vs classical: obstacle left / right / centre / none
+python3 test_frenet_rl.py [model] [--set single|multi|hard|all]   # animated, SAC and classical side by side
+python3 compare_rl_frenet.py [model] [--multi]                      # tables: left / right / centre / none, or multi-obstacle
 ```
 
-**Results in simulation (robot settings).** `compare_rl_frenet.py`, model
-`sac_frenet_straight_robot_s1_50k`, 5 runs per case with ±0.05 m obstacle
-measurement noise, pure pursuit at 40 Hz, both planners replanning every
-tick:
+**Results in simulation (robot settings, clearance 1.2 m).** Model
+`sac_frenet_straight_multi_s1_200k`. Both planners replan every tick, and
+pure pursuit runs at 40 Hz. "SAC" means the logic used on the car: the
+gate, the policy, the hard checks, and a fallback to the classical planner
+on any tick where the RL path is rejected.
 
-| Case | Planning time, SAC / classical | Min distance to obstacle, SAC / classical | Mean \|d\|, SAC / classical |
-|---|---|---|---|
-| Obstacle left (−0.5 m) | 0.47 / 14.0 ms | 1.41 / 0.80 m | 0.101 / 0.022 m |
-| Obstacle right (+0.5 m) | 0.50 / 14.8 ms | 1.42 / 0.79 m | 0.104 / 0.021 m |
-| Obstacle centred | 0.53 / 15.3 ms | 1.32 / 0.98 m | 0.140 / 0.004 m |
-| No obstacle | 0.45 / 14.9 ms | — | 0.015 / 0.002 m |
+200 generated layouts with 1–3-obstacle clusters (feasible by the constraints above):
 
-- **SAC:** 0/20 collisions. It plans ~30× faster and passes obstacles with
-  more margin.
-- **Classical planner:** holds the lane centre more tightly. It passes 0.2 m
-  outside the 0.6 m robot radius. With a centred obstacle it found no
-  feasible path in 5/5 runs; the car was still 0.98 m away, so this was a
-  planner failure rather than a collision.
-- The model is a 50k-step checkpoint. Training was interrupted, and a second
-  seed at 50k still drifted 0.10 m on an empty road.
+| | Classical planner | SAC |
+|---|---|---|
+| Failures | **122/200**, all "no feasible path" | **3/200** |
+| Min distance to obstacles (5th percentile) | — | 0.98 m |
+| Planning time per tick | ~15 ms | 0.6 ms |
+| Ticks that fell back to classical | — | 0.1 % |
 
-Earlier figures for v2 came from a simulation that did not match the car
-(training-script planner settings, 2 Hz pure pursuit, different sign
-handling). They are superseded by the table above.
+Of the 3 SAC failures, the classical planner alone also fails one.
+Without the fallback, the policy alone fails 7/200.
+
+Single obstacle:
+- Policy alone: 0/87 collisions for obstacles near the car's line, and
+  0/400 over random episodes with ±0.05 m obstacle measurement noise.
+- Empty road: lane offset 0.06 m (classical ≈ 0.00 m).
+
+Why the classical planner fails: each tick it picks the cheapest path on a
+discrete grid, and `plan_center_weight` 20 pulls it strongly to the centre.
+It stays centred until the obstacle is too close, then finds no feasible
+path. The policy learned to start avoiding earlier.
+
+Caveats:
+- Single seed, simulation only.
+- Evaluation layouts come from the same generator as training (different seeds).
+- The classical baseline uses the robot's current tuning (horizon 2–3 s).
+  A classical planner with a longer horizon, able to use the 8 m vision
+  range, has not been compared yet.
+
+Training saturated after ~300k steps (7–13/200 multi-obstacle failures for
+every checkpoint up to 700k). The released model is the 200k checkpoint,
+which had the fewest failures.
+
+`test_frenet_rl.py --set hard` replays some of these layouts. It includes
+the 3 remaining SAC failures and 2 layouts where only the classical planner
+fails.
 
 ## Known limitations
 
@@ -297,6 +338,8 @@ handling). They are superseded by the table above.
   under which the tuned classical planner holds the lane in simulation.
   The change is confined to `sim_predict` in `train_frenet_rl.py`;
   `control/ekf.py` and `control/pure_pursuit.py` are unchanged.
+- `plan_clearance` was lowered from 3.2 m to 1.2 m. This also changes the
+  classical planner on the car: it now passes closer to obstacles.
 - The obstacle vision range used in training is 8 m. The perception config
   has no explicit range limit, so check that obstacles are actually
   detected that far on the car.
