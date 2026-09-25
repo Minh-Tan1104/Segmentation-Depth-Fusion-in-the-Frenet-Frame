@@ -26,4 +26,7 @@ plots/
 videos/
 tb_logs/
 .venv/
-videos_report/
+videos_report/*
+!videos_report/*_compare.mp4
+!videos_report/train_curves.png
+!videos_report/train_checkpoints.png
