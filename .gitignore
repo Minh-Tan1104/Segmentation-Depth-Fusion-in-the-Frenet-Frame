@@ -29,4 +29,4 @@ tb_logs/
 videos_report/*
 !videos_report/*_compare.mp4
 !videos_report/train_curves.png
-!videos_report/train_checkpoints.png
+!videos_report/eval_results.png

@@ -322,6 +322,29 @@ Caveats:
 The released model is the 150k checkpoint: the first one with no layout
 that the classical planner passes and SAC fails.
 
+**Training curves.** Built from the 150 000 transitions (1 376 episodes)
+in the replay buffer saved at 150k steps; lines are 50-episode moving
+averages. The failure rate during training includes exploration noise and
+runs without the gate, so it is higher than the evaluation results.
+
+![SAC training curves](videos_report/train_curves.png)
+
+- (a) Return per episode rises from about −200 to about −80 within 15k steps,
+  then slowly to about −30 by 150k.
+- (b) Failed episodes drop from ~90 % to 10–20 %; leaving the lane is
+  near zero after ~45k steps.
+- (c) On an empty road, |d| falls from 0.35 m to ~0.1 m.
+- (d) With an obstacle in view, |d| settles around 0.4 m (the avoidance
+  offset).
+
+**Evaluation summary** of the final model against the classical planner:
+
+![Evaluation of the SAC planner vs the classical planner](videos_report/eval_results.png)
+
+Side-by-side videos of the 10 representative scenarios are in
+[`videos_report/`](videos_report/) (`<scenario>_compare.mp4`, SAC left,
+classical right).
+
 **Representative scenarios** (`test_frenet_rl.py --set report --video DIR`).
 In the test script both planners pick `Ti` from the same range, 2.0–3.0 s:
 the classical planner samples 2.0, 2.2, …, 3.0 s (`np.arange` on the car
