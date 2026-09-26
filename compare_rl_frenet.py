@@ -62,9 +62,9 @@ INIT_PSI_DEG = 3.0   # |psi0| <= 3°
 
 
 def fixed_horizon_cfg(planner_cfg, horizon_s):
-    """Config chỉ lấy mẫu đúng 1 Ti = horizon_s (np.arange bỏ max_t nên +dt/2)."""
+    """Config chỉ lấy mẫu đúng 1 Ti = horizon_s."""
     import dataclasses
-    return dataclasses.replace(planner_cfg, min_t=horizon_s, max_t=horizon_s + planner_cfg.dt / 2)
+    return dataclasses.replace(planner_cfg, min_t=horizon_s, max_t=horizon_s)
 
 
 class RLPlanner:

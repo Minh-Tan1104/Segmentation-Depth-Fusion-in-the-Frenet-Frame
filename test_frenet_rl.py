@@ -60,12 +60,6 @@ from train_frenet_rl import (
 
 MODEL_PATH = os.path.join(MODELS_DIR, "sac_frenet_straight_parity_s1_150k")
 
-# Frenet lấy mẫu Ti = np.arange(min_t, max_t, dt) nên bỏ mất max_t (3.0 s);
-# RL chọn Ti liên tục trong [min_t, max_t]. +dt/2 để Frenet có đủ 2.0..3.0 s
-# như RL — cùng miền Ti cho 2 phương pháp.
-import dataclasses
-TEST_PLANNER_CFG = dataclasses.replace(PLANNER_CFG, max_t=PLANNER_CFG.max_t + PLANNER_CFG.dt / 2)
-
 # Tầm dọc panel [m] khi vẽ/quay video (path robot dài 2-3 m).
 PANEL_VIEW_M = 5.0
 
@@ -293,8 +287,8 @@ def _run_method_process(method: str, model_path: str, set_name: str, result_queu
     này, chạy tuần tự qua toàn bộ kịch bản cho ĐÚNG 1 phương pháp, gửi kết quả
     về process cha qua Queue. 2 process chạy thật song song."""
     live = LivePanel(name=method)
-    planner = (_CountingRLPlanner(model_path, planner_cfg=TEST_PLANNER_CFG, horizon_s=horizon_s)
-               if method == "SAC" else FrenetPlanner(planner_cfg=TEST_PLANNER_CFG, horizon_s=horizon_s))
+    planner = (_CountingRLPlanner(model_path, planner_cfg=PLANNER_CFG, horizon_s=horizon_s)
+               if method == "SAC" else FrenetPlanner(planner_cfg=PLANNER_CFG, horizon_s=horizon_s))
     results = []
     for name, obstacles, d0, psi0 in scenario_set(set_name):
         if video_dir:

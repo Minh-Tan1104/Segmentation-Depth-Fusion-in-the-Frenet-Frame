@@ -73,7 +73,7 @@ class PlannerLogic:
                 # cv = k_j*Js+k_t*Ti+k_d*ds.
                 k_d=plan_center_weight,
                 # Horizon thời gian cho polynomial ngang (di_values sinh trong
-                # khoảng [min_t, max_t)) — khi lệch ngang lớn + plan_center_weight
+                # khoảng [min_t, max_t], gồm cả max_t) — khi lệch ngang lớn + plan_center_weight
                 # cao ép path về hẳn center_offset, quay về TRONG THỜI GIAN NGẮN
                 # đòi hỏi độ cong lớn ở đoạn đầu path. Kéo dài horizon này cho
                 # cùng quãng đường ngang cần đi thì độ cong giảm hẳn (đã đo: c_d=1.5m,

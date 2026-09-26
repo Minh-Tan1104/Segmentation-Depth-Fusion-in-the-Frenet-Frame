@@ -242,7 +242,9 @@ class FrenetOptimalPlanner:
         # max_road_width (plan_road_width) làm nửa bề rộng thay vì hardcode.
         n_steps = max(1, int(round(cfg.max_road_width / cfg.d_road_w)))
         di_values = cfg.center_offset + cfg.d_road_w * np.arange(-n_steps, n_steps + 1)
-        Ti_values = np.arange(cfg.min_t, cfg.max_t, cfg.dt)
+        # Gồm cả max_t (+dt/2 chống sai số float): arange(min_t, max_t) bỏ
+        # mất max_t, trong khi RL chọn Ti liên tục trong [min_t, max_t].
+        Ti_values = np.arange(cfg.min_t, cfg.max_t + cfg.dt / 2, cfg.dt)
         tv_values = np.arange(
             cfg.target_speed - cfg.d_t_s * cfg.n_s_sample,
             cfg.target_speed + cfg.d_t_s * cfg.n_s_sample + 1e-9,
