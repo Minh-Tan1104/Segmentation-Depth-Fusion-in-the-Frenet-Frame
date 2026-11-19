@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# ROS2 colcon build artifacts (install/ is a static copy, never symlinked)
+build/
+install/
+log/
